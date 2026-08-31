@@ -43,9 +43,9 @@
     "eslint-plugin-simple-import-sort": "14.0.0",
     "eslint-plugin-unused-imports": "4.4.1",
     "jsonc-eslint-parser": "3.3.0",
-    "knip": "6.32.2",
+    "knip": "6.33.0",
     "prettier": "3.9.6",
-    "turbo": "2.10.11",
+    "turbo": "2.10.12",
     "typescript": "5.9.3",
     "vitest": "4.1.11"
   },
