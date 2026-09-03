@@ -659,6 +659,20 @@ fn repair_session_rails_with(
                                 window.clone(),
                                 tags::SIDEBAR.into(),
                                 "1".into(),
+                                ";".into(),
+                                // AND THE CURSOR GOES BACK, LAST. A repair
+                                // pass that mints a missing rail must not
+                                // leave the operator typing into furniture.
+                                // `-l` is the window's last pane, which a
+                                // split makes the pane that was active before
+                                // it — not the split target. It follows the
+                                // tag because the tag resolves a WINDOW target
+                                // to the active pane, which must still be the
+                                // new rail.
+                                "select-pane".into(),
+                                "-l".into(),
+                                "-t".into(),
+                                window.clone(),
                             ],
                         },
                     )

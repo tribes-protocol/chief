@@ -245,6 +245,14 @@ fn missing_sidebar_is_repaired_with_bare_chief_in_the_company_directory() {
             "@2",
             "@organization_sidebar",
             "1",
+            ";",
+            // And the batch ends by handing the cursor back to the pane the
+            // split took it from, so a repair never moves the operator into
+            // the sidebar. It is last because the tag above names a WINDOW.
+            "select-pane",
+            "-l",
+            "-t",
+            "@2",
         ],
         "the current sidebar verb takes no company argument and resolves the company from cwd, \
          and the pane is tagged in the same command sequence that creates it"
@@ -307,6 +315,55 @@ fn a_repaired_rail_is_never_observable_before_it_carries_its_tag() {
         }),
         "and NO standalone tagging invocation survives; a separate one is exactly the gap a \
          concurrent sweep splits a second rail into: {calls:?}"
+    );
+}
+
+/// A REPAIR PASS DOES NOT TAKE THE CURSOR AWAY FROM THE PERSON.
+///
+/// The mint batch has no `-d`, so the new rail is active for the tag that
+/// follows it. The batch therefore ends by giving the cursor back with
+/// `select-pane -l` — the window's last pane, which the split makes the pane
+/// that was active before it. Without it, a rail repaired under an operator
+/// who is typing moves them into the sidebar mid-sentence.
+#[test]
+fn a_repaired_rail_gives_the_cursor_back_after_it_is_tagged() {
+    let scripted = ScriptedTmux::new([
+        ScriptedReply::ok("@1\t%1\t1\n@2\t%2"),
+        ScriptedReply::ok(""),
+        ScriptedReply::ok(""),
+        ScriptedReply::ok("%9"),
+        ScriptedReply::ok(""),
+    ])
+    .recording_viewport_authority();
+    let exec = executor(scripted);
+
+    repair_session_rails_with(
+        &exec,
+        &socket(),
+        "cobalt-session",
+        "/data/cobalt",
+        std::path::Path::new("/opt/chief/bin/chief"),
+    )
+    .expect("the missing rail is repaired");
+
+    let calls = exec.tmux_host().runner().calls();
+    let split = calls
+        .iter()
+        .find(|call| call.first().is_some_and(|verb| verb == "split-window"))
+        .expect("the mint batch");
+    let commands: Vec<&[String]> = split.split(|arg| arg == ";").collect();
+    assert_eq!(
+        commands.last().expect("the batch is not empty"),
+        &["select-pane".to_owned(), "-l".to_owned(), "-t".to_owned(), "@2".to_owned()],
+        "the batch ends by restoring the pane the split took the cursor from: {split:?}"
+    );
+    let tag = commands
+        .iter()
+        .position(|command| command.iter().any(|arg| arg == "@organization_sidebar"))
+        .expect("the tag");
+    assert!(
+        tag < commands.len() - 1,
+        "the tag names a WINDOW, so it must land while the rail is still active: {split:?}"
     );
 }
 
@@ -1231,6 +1288,67 @@ fn real_viewport_repair_never_publishes_a_one_column_rail() {
     assert_eq!(after, before, "the same body and rail panes survive the repair");
     assert_eq!(rails.lines().filter(|marker| marker.trim() == "1").count(), 1);
     assert_eq!(remembered, "31", "viewport repair never writes the sidebar preference");
+}
+
+/// THE OPERATOR KEEPS THE CURSOR, PROVED AGAINST A REAL TMUX SERVER.
+///
+/// The argv tests above pin the frame; only tmux can answer what the frame
+/// DOES. A real window that is missing its rail is repaired here, and the pane
+/// left active afterwards must be the person's pane and not the rail tmux made
+/// active when it split. `remain-on-exit` keeps the rail pane after its
+/// stand-in program exits, so the question this test asks stays askable.
+#[test]
+fn real_rail_repair_leaves_the_person_pane_active_and_not_the_rail() {
+    let raw = SystemTmuxRunner::default();
+    let socket = Socket(format!("chiefd-rail-cursor-{}", std::process::id()));
+    let session = format!("chiefd-rail-cursor-{}", std::process::id());
+    real_tmux_ok(
+        &raw,
+        &socket,
+        &["new-session", "-d", "-s", &session, "-x", "240", "-y", "56", "sleep", "120"],
+    );
+    real_tmux_ok(
+        &raw,
+        &socket,
+        &["set-option", "-w", "-t", &session, "@organization_window_id", "executive"],
+    );
+    real_tmux_ok(&raw, &socket, &["set-option", "-t", &session, "@organization_id", "cobalt"]);
+    real_tmux_ok(&raw, &socket, &["set-option", "-w", "-t", &session, "remain-on-exit", "on"]);
+    let person = real_tmux_ok(&raw, &socket, &["list-panes", "-t", &session, "-F", "#{pane_id}"])
+        .trim()
+        .to_owned();
+
+    let exec = RealHostExecutor::new(
+        TmuxHost::new(raw, RecordingWaiter::default()),
+        ProcReader::default(),
+    );
+    let repaired = repair_session_rails_with(
+        &exec,
+        &socket,
+        &session,
+        "/tmp",
+        std::path::Path::new("/bin/false"),
+    );
+    let panes = real_tmux_ok(
+        exec.tmux_host().runner(),
+        &socket,
+        &[
+            "list-panes",
+            "-t",
+            &session,
+            "-F",
+            "#{pane_id}\t#{pane_active}\t#{@organization_sidebar}",
+        ],
+    );
+    real_tmux_ok(exec.tmux_host().runner(), &socket, &["kill-server"]);
+
+    assert_eq!(repaired.expect("the rail is repaired"), 1, "one rail was missing: {panes}");
+    let rows: Vec<Vec<&str>> = panes.lines().map(|line| line.split('\t').collect()).collect();
+    assert_eq!(rows.len(), 2, "the person pane and its new rail: {panes}");
+    let active: Vec<&str> = rows.iter().filter(|row| row[1] == "1").map(|row| row[0]).collect();
+    assert_eq!(active, vec![person.as_str()], "the operator is left in their own pane: {panes}");
+    let rail = rows.iter().find(|row| row[0] != person).expect("the minted rail");
+    assert_eq!(rail[2], "1", "and the rail it did not move to is tagged: {panes}");
 }
 
 /// A browser-like attached client must not publish tmux's proportional split.

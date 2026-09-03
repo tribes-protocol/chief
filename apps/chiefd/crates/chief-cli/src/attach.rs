@@ -760,9 +760,9 @@ fn viewport_manifest_survey(
 /// `split-window` starts the rail process, so a tag or resize sent in a later
 /// tmux invocation is already too late: the rail client can draw the transient
 /// PTY it received at birth. Tmux redraws after a command sequence, so stamp
-/// the shared width, split at that width, tag the active new pane, and repeat
-/// the exact pane width in ONE queue. The operator can then see only the final
-/// frame.
+/// the shared width, split at that width, tag the active new pane, repeat the
+/// exact pane width, and hand the cursor back to the pane the operator was in
+/// — all in ONE queue. The operator can then see only the final frame.
 fn rail_mint_argv(
     _session: &str,
     window: &str,
@@ -798,6 +798,20 @@ fn rail_mint_argv(
         "resize-pane".to_owned(),
         "-x".to_owned(),
         columns.to_string(),
+        "-t".to_owned(),
+        window.to_owned(),
+        ";".to_owned(),
+        // THE CURSOR GOES BACK, AND IT GOES BACK LAST. The rail is furniture;
+        // the person is the product. `split-window` left the rail active, so
+        // without this the operator opens their company typing into the
+        // sidebar. `-l` is the window's LAST pane, which after a split is the
+        // pane that was active before it — measured on tmux 3.7c, and true
+        // even when the split targeted some other pane. It is the final
+        // command of the frame on purpose: the tag and the resize above
+        // resolve a WINDOW target to its active pane, so a selection moved
+        // ahead of either would write them to the wrong pane.
+        "select-pane".to_owned(),
+        "-l".to_owned(),
         "-t".to_owned(),
         window.to_owned(),
     ]
@@ -3120,7 +3134,7 @@ mod tests {
                 columns,
             );
             let commands: Vec<&[String]> = argv.split(|arg| arg == ";").collect();
-            assert_eq!(commands.len(), 3, "all writes belong to one tmux invocation: {argv:?}");
+            assert_eq!(commands.len(), 4, "all writes belong to one tmux invocation: {argv:?}");
 
             let mut rail_columns = None;
             let mut rail_tagged = false;
@@ -3146,6 +3160,9 @@ mod tests {
                             .flatten();
                         rail_columns = width;
                     }
+                    // The rail is built and then handed back; see the frame's
+                    // own test below for why this one is last.
+                    Some("select-pane") => {}
                     other => panic!("unexpected simulated tmux command {other:?}: {command:?}"),
                 }
             }
@@ -3159,6 +3176,52 @@ mod tests {
                     && !argv.iter().any(|arg| arg == trust::sidebar_options::COLLAPSED),
                 "attach consumes preferences and never writes them: {argv:?}"
             );
+        }
+    }
+
+    /// THE OPERATOR LANDS ON THE PERSON, NOT ON THE FURNITURE.
+    ///
+    /// `split-window` has no `-d`, so the rail is the active pane the moment it
+    /// exists — which is what the tag and the resize above need, and which
+    /// also means a bare `chief` used to open with the cursor in the sidebar
+    /// instead of in the pane the operator types into. The frame gives it back
+    /// with `select-pane -l`: the window's last pane, which a split makes the
+    /// pane that was active before it. It must be the LAST command of the
+    /// frame — every write before it names a WINDOW, which tmux resolves to
+    /// the active pane, so a selection moved earlier would tag and resize the
+    /// wrong pane.
+    #[test]
+    fn the_rail_frame_hands_the_cursor_back_after_every_other_write() {
+        let argv = rail_mint_argv(
+            "org-acme_",
+            "@7",
+            Path::new("/tmp/acme"),
+            Path::new("/usr/bin/chief"),
+            26,
+        );
+        let commands: Vec<&[String]> = argv.split(|arg| arg == ";").collect();
+        let last = commands.last().expect("the frame is not empty");
+        assert_eq!(
+            last,
+            &["select-pane".to_owned(), "-l".to_owned(), "-t".to_owned(), "@7".to_owned()],
+            "the frame ends by restoring the pane the split took the cursor from: {argv:?}"
+        );
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| command.first().is_some_and(|v| v == "select-pane"))
+                .count(),
+            1,
+            "exactly one selection, and it is that one: {argv:?}"
+        );
+        // Both window-targeted writes still run while the rail is active.
+        let selection = commands.len() - 1;
+        for verb in ["split-window", "set-option", "resize-pane"] {
+            let at = commands
+                .iter()
+                .position(|command| command.first().is_some_and(|first| first == verb))
+                .unwrap_or_else(|| panic!("the frame still carries {verb}: {argv:?}"));
+            assert!(at < selection, "{verb} must run before the cursor moves off the rail");
         }
     }
 
@@ -4439,6 +4502,59 @@ mod tests {
             "the accepted manifest belongs to the retried topology"
         );
         let _ = tmux::run(&socket, &["kill-server"]);
+    }
+
+    /// A REAL ATTACH LEAVES THE CURSOR ON THE PERSON.
+    ///
+    /// This is the operator's own report: a bare `chief` opened the company
+    /// with the cursor in the sidebar rather than in the pane they type into.
+    /// The argv test above pins the frame; only tmux can say what the frame
+    /// leaves active, so the mint frame is run here against a real server.
+    /// `remain-on-exit` keeps the rail pane after its stand-in program exits.
+    #[test]
+    fn a_real_rail_mint_leaves_the_person_pane_active() {
+        if !require_tmux() {
+            return;
+        }
+        let socket = unique_socket("attach-rail-cursor");
+        let session = "org-attach-cursor_";
+        start_session(&socket, session, &["-x", "240", "-y", "56", "sleep", "120"]);
+        assert!(
+            tmux::run(&socket, &["set-option", "-w", "-t", session, "remain-on-exit", "on"]).ok()
+        );
+        let person = tmux::run(&socket, &["list-panes", "-t", session, "-F", "#{pane_id}"])
+            .stdout
+            .trim()
+            .to_owned();
+        let window = tmux::run(&socket, &["display-message", "-p", "-t", session, "#{window_id}"])
+            .stdout
+            .trim()
+            .to_owned();
+
+        let argv = rail_mint_argv(session, &window, Path::new("/tmp"), Path::new("/bin/false"), 26);
+        let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+        let minted = tmux::run(&socket, &refs);
+        assert!(minted.ok(), "the mint frame ran: {}", minted.diagnostic());
+
+        let panes = tmux::run(
+            &socket,
+            &[
+                "list-panes",
+                "-t",
+                session,
+                "-F",
+                &format!("#{{pane_id}}\t#{{pane_active}}\t#{{{}}}", trust::tags::SIDEBAR),
+            ],
+        )
+        .stdout;
+        let _ = tmux::run(&socket, &["kill-server"]);
+
+        let rows: Vec<Vec<&str>> = panes.lines().map(|line| line.split('\t').collect()).collect();
+        assert_eq!(rows.len(), 2, "the person pane and its new rail: {panes}");
+        let active: Vec<&str> = rows.iter().filter(|row| row[1] == "1").map(|row| row[0]).collect();
+        assert_eq!(active, vec![person.as_str()], "the operator keeps their own pane: {panes}");
+        let rail = rows.iter().find(|row| row[0] != person).expect("the minted rail");
+        assert_eq!(rail[2], "1", "and the rail it did not move to is tagged: {panes}");
     }
 
     #[test]
