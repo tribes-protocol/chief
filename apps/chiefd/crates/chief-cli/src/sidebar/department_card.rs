@@ -129,6 +129,8 @@ pub struct Member {
     /// provider resolution of its own; that is `launch_catalog`'s job and one
     /// implementation of it is enough.
     pub model: String,
+    /// Messages still in this person's durable inbox view.
+    pub inbox_messages: usize,
     /// Whether this person heads the department.
     pub head: bool,
 }
@@ -408,14 +410,15 @@ fn draw_rollup(frame: &mut Frame<'_>, area: Rect, card: &Card, palette: &Palette
     frame.render_widget(Paragraph::new(lines), area);
 }
 
-/// One cell between each of the four columns.
-const COLUMN_SPACING: u16 = 3;
+/// One cell between each of the five columns.
+const COLUMN_SPACING: u16 = 4;
 
-/// Where each column sits in the `[name, role, state, model]` array.
+/// Where each column sits in the `[name, role, state, inbox, model]` array.
 const NAME: usize = 0;
 const ROLE: usize = 1;
 const STATE: usize = 2;
-const MODEL: usize = 3;
+const INBOX: usize = 3;
+const MODEL: usize = 4;
 
 /// The glyph and its trailing space, in front of every name.
 const GLYPH_WIDTH: u16 = 2;
@@ -430,15 +433,13 @@ const HEAD_MARKER_WIDTH: u16 = 8;
 /// The model is last because it is the column an operator asked for by name,
 /// and the role is first because it is the one they can most afford to lose —
 /// a truncated job title is still recognisable, a truncated model id is not.
-const SHRINK_ORDER: [(usize, u16); 4] = [(ROLE, 0), (NAME, 6), (STATE, 4), (MODEL, MODEL_FLOOR)];
-
 /// The narrowest the model column may be made while anything else still has
 /// cells to give. Below this a model id is unrecognisable, which is the same as
 /// not drawing it.
 const MODEL_FLOOR: u16 = 12;
 
 /// What each column needs to draw every one of `members` in full.
-fn wants(members: &[Member]) -> [u16; 4] {
+fn wants(members: &[Member]) -> [u16; 5] {
     let longest = |pick: &dyn Fn(&Member) -> usize| -> u16 {
         u16::try_from(members.iter().map(pick).max().unwrap_or_default()).unwrap_or(u16::MAX)
     };
@@ -449,11 +450,12 @@ fn wants(members: &[Member]) -> [u16; 4] {
                 + if member.head { usize::from(HEAD_MARKER_WIDTH) } else { 0 }
         }),
         longest(&|member| label(member.state).chars().count()),
+        longest(&|member| member.inbox_messages.to_string().chars().count()).max(5),
         longest(&|member| member.model.chars().count()),
     ]
 }
 
-/// Column widths for the member table — `[name, role, state, model]` — given
+/// Column widths for the member table — `[name, role, state, inbox, model]` — given
 /// the pane's width and the people it has to draw.
 ///
 /// # It allocates from the CONTENT, and filling the pane is not the goal
@@ -475,14 +477,24 @@ fn wants(members: &[Member]) -> [u16; 4] {
 /// correct picture of a short answer, not wasted space.
 ///
 /// Public so the tests can pin the two invariants that outlive any of this
-/// arithmetic: the four columns plus their spacing never overflow the pane at
+/// arithmetic: the five columns plus their spacing never overflow the pane at
 /// ANY width, and the model column is the last one to give up a cell.
 #[must_use]
-pub fn columns(width: u16, members: &[Member]) -> [u16; 4] {
+pub fn columns(width: u16, members: &[Member]) -> [u16; 5] {
     let usable = width.saturating_sub(COLUMN_SPACING);
     let mut given = wants(members);
     let mut over = given.iter().copied().sum::<u16>().saturating_sub(usable);
-    for (column, floor) in SHRINK_ORDER {
+    // The inbox header may give way, but the decimal answer never does. This
+    // keeps a large count exact before the model gives up a cell.
+    let inbox_floor = members
+        .iter()
+        .map(|member| member.inbox_messages.to_string().chars().count())
+        .max()
+        .and_then(|width| u16::try_from(width).ok())
+        .unwrap_or_default();
+    for (column, floor) in
+        [(ROLE, 0), (NAME, 6), (STATE, 4), (INBOX, inbox_floor), (MODEL, MODEL_FLOOR)]
+    {
         if over == 0 {
             break;
         }
@@ -496,9 +508,16 @@ pub fn columns(width: u16, members: &[Member]) -> [u16; 4] {
     // leaves the columns past the end at zero; when the floors DO fit it
     // changes nothing.
     let mut left = usable;
-    let mut fitted = [0_u16; 4];
-    for column in [NAME, MODEL, STATE, ROLE] {
-        fitted[column] = given[column].min(left);
+    let mut fitted = [0_u16; 5];
+    for column in [NAME, INBOX, MODEL, STATE, ROLE] {
+        fitted[column] = if column == INBOX && given[column] > left {
+            // A partial decimal is a different number. Hide this column when
+            // the pane cannot hold every digit; the next wider frame restores
+            // it whole.
+            0
+        } else {
+            given[column].min(left)
+        };
         left -= fitted[column];
     }
     fitted
@@ -506,7 +525,7 @@ pub fn columns(width: u16, members: &[Member]) -> [u16; 4] {
 
 /// The member table.
 fn draw_members(frame: &mut Frame<'_>, area: Rect, card: &Card, palette: &Palette) {
-    let [name_w, role_w, state_w, model_w] = columns(area.width, &card.members);
+    let [name_w, role_w, state_w, inbox_w, model_w] = columns(area.width, &card.members);
     let rows: Vec<Row<'_>> = card
         .members
         .iter()
@@ -536,6 +555,10 @@ fn draw_members(frame: &mut Frame<'_>, area: Rect, card: &Card, palette: &Palett
                 Span::styled(role, Style::default().fg(palette.dim)),
                 Span::styled(fit(label(state), usize::from(state_w)), Style::default().fg(colour)),
                 Span::styled(
+                    format!("{:>width$}", member.inbox_messages, width = usize::from(inbox_w)),
+                    Style::default().fg(palette.dim),
+                ),
+                Span::styled(
                     fit(&member.model, usize::from(model_w)),
                     Style::default().fg(palette.dim),
                 ),
@@ -548,9 +571,20 @@ fn draw_members(frame: &mut Frame<'_>, area: Rect, card: &Card, palette: &Palett
             Constraint::Length(name_w),
             Constraint::Length(role_w),
             Constraint::Length(state_w),
+            Constraint::Length(inbox_w),
             Constraint::Length(model_w),
         ],
     )
+    .header(Row::new(vec![
+        Span::raw(""),
+        Span::raw(""),
+        Span::raw(""),
+        Span::styled(
+            format!("{:>width$}", "inbox", width = usize::from(inbox_w)),
+            Style::default().fg(palette.dim),
+        ),
+        Span::raw(""),
+    ]))
     .column_spacing(1);
     frame.render_widget(table, area);
 }

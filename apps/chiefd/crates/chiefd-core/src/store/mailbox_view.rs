@@ -85,11 +85,15 @@ pub fn view(tx: &Transaction<'_>, slug: &str, person: &str) -> Result<MailboxVie
     let mut out = MailboxView::default();
     for entry in snapshot.entries {
         match MailboxState::parse(&entry.state) {
-            Some(MailboxState::Pending | MailboxState::Delivered) => out.pending.push(entry),
+            Some(state) if state.is_inbox_message() => out.pending.push(entry),
             Some(MailboxState::Accepted) => out.accepted.push(entry),
             Some(MailboxState::Superseded) => out.superseded.push(entry),
             Some(MailboxState::Rejected) => out.rejected.push(entry),
             Some(MailboxState::Resolved) => out.resolved.push(entry),
+            // Exhaustive even though the guard above has already handled both
+            // states. If its rule changes, these rows stay out of a terminal
+            // bucket rather than being silently misclassified.
+            Some(MailboxState::Pending | MailboxState::Delivered) => {}
             // `reconstruct_person` already fails closed (a store error)
             // on an unparseable state, so this arm is unreachable in practice;
             // it is kept exhaustive rather than a wildcard so a state that is

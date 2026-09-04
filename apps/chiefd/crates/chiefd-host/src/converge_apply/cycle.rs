@@ -375,6 +375,7 @@ fn build_launch_catalog_for_cycle(
         // them".
         let Some(person) = org.people.get(person_id) else { continue };
         catalog.roster.push(person_id.clone());
+        catalog.inbox_counts.insert(person_id.clone(), 0);
         let entry = launch_entry(
             org,
             config,

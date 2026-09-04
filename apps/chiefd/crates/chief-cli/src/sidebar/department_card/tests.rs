@@ -7,22 +7,32 @@
 //! fails, because nobody goes looking.
 
 use super::*;
+use ratatui::backend::TestBackend;
 
 fn member(name: &str, role: &str, state: PersonState, model: &str, head: bool) -> Member {
-    Member { name: name.to_owned(), role: role.to_owned(), state, model: model.to_owned(), head }
+    Member {
+        name: name.to_owned(),
+        role: role.to_owned(),
+        state,
+        model: model.to_owned(),
+        inbox_messages: 0,
+        head,
+    }
 }
 
 fn engineering() -> Card {
+    let mut members = vec![
+        member("Ada", "Head of Engineering", PersonState::Working, "deepseek-v4-flash", true),
+        member("Owen", "Planner", PersonState::Working, "deepseek-v4-flash", false),
+        member("Rhea", "Software Engineer", PersonState::Sleeping, "deepseek-v4-flash", false),
+        member("Kai", "Software Engineer", PersonState::Working, "glm-5.2", false),
+        member("Wren", "Code Reviewer", PersonState::Refused, "", false),
+    ];
+    members[1].inbox_messages = 12;
     Card {
         name: "Engineering".to_owned(),
         path: vec!["Taperoom Inc".to_owned()],
-        members: vec![
-            member("Ada", "Head of Engineering", PersonState::Working, "deepseek-v4-flash", true),
-            member("Owen", "Planner", PersonState::Working, "deepseek-v4-flash", false),
-            member("Rhea", "Software Engineer", PersonState::Sleeping, "deepseek-v4-flash", false),
-            member("Kai", "Software Engineer", PersonState::Working, "glm-5.2", false),
-            member("Wren", "Code Reviewer", PersonState::Refused, "", false),
-        ],
+        members,
         children: vec!["Platform".to_owned()],
     }
 }
@@ -276,7 +286,7 @@ fn a_wide_pane_draws_a_long_model_whole_rather_than_clipping_it_beside_blank_spa
         ],
         children: Vec::new(),
     };
-    let [_, _, _, model_w] = columns(200, &card.members);
+    let [_, _, _, _, model_w] = columns(200, &card.members);
     let width = u16::try_from(model.chars().count()).expect("a model id fits a u16");
     assert_eq!(model_w, width, "a 200-column pane can hold this model whole");
     assert_eq!(fit(model, usize::from(model_w)), model, "so it is drawn whole, with no ellipsis");
@@ -288,10 +298,11 @@ fn a_wide_pane_draws_a_long_model_whole_rather_than_clipping_it_beside_blank_spa
 #[test]
 fn a_wide_pane_draws_every_column_whole_including_the_head_marker() {
     let card = engineering();
-    let [name_w, role_w, state_w, model_w] = columns(200, &card.members);
+    let [name_w, role_w, state_w, inbox_w, model_w] = columns(200, &card.members);
     assert_eq!(name_w, 6, "the longest name is four characters, plus the glyph and its space");
     assert_eq!(role_w, 27, "`Head of Engineering` plus room for ` (head)`");
     assert_eq!(state_w, 12, "`cannot start`, whole");
+    assert_eq!(inbox_w, 5, "the `inbox` header is whole");
     assert_eq!(model_w, 17, "`deepseek-v4-flash`, whole");
     let ada = &card.members[0];
     assert_eq!(
@@ -319,8 +330,8 @@ fn a_wide_pane_does_not_stretch_the_columns_to_fill_it() {
 #[test]
 fn a_narrow_pane_keeps_the_model_column_and_shrinks_the_role() {
     let card = engineering();
-    let [_, wide_role, _, wide_model] = columns(129, &card.members);
-    let [_, narrow_role, _, narrow_model] = columns(60, &card.members);
+    let [_, wide_role, _, _, wide_model] = columns(129, &card.members);
+    let [_, narrow_role, _, _, narrow_model] = columns(60, &card.members);
     assert!(narrow_role < wide_role, "the role column gives way first");
     assert!(narrow_model >= MODEL_FLOOR, "the model column never collapses: {narrow_model}");
     assert_eq!(narrow_model, wide_model, "and it gives up nothing while the role still can");
@@ -331,15 +342,16 @@ fn a_narrow_pane_keeps_the_model_column_and_shrinks_the_role() {
 #[test]
 fn the_model_is_the_last_column_to_give_up_a_cell() {
     let card = engineering();
-    let mut previous = columns(u16::MAX, &card.members)[3];
+    let mut previous = columns(u16::MAX, &card.members)[4];
     let mut model_shrank_at = None;
     for width in (10..=140_u16).rev() {
-        let [name, role, state, model] = columns(width, &card.members);
+        let [name, role, state, inbox, model] = columns(width, &card.members);
         if model < previous {
             model_shrank_at = Some(width);
             assert_eq!(role, 0, "the role had nothing left to give at width {width}");
             assert_eq!(name, 6, "and the name was at its floor: {name}");
             assert_eq!(state, 4, "and so was the state: {state}");
+            assert_eq!(inbox, 2, "and the two-digit inbox answer stayed whole: {inbox}");
             break;
         }
         previous = model;
@@ -355,10 +367,10 @@ fn the_model_is_the_last_column_to_give_up_a_cell() {
 fn the_columns_always_fit_inside_the_pane() {
     let card = engineering();
     for width in 0..=512_u16 {
-        let [name, role, state, model] = columns(width, &card.members);
+        let [name, role, state, inbox, model] = columns(width, &card.members);
         assert!(
-            name + role + state + model + COLUMN_SPACING <= width.max(COLUMN_SPACING),
-            "columns overflow at width {width}: {name}+{role}+{state}+{model}"
+            name + role + state + inbox + model + COLUMN_SPACING <= width.max(COLUMN_SPACING),
+            "columns overflow at width {width}: {name}+{role}+{state}+{inbox}+{model}"
         );
     }
 }
@@ -369,8 +381,8 @@ fn the_columns_always_fit_inside_the_pane() {
 fn a_one_cell_pane_produces_no_columns_rather_than_panicking() {
     let card = engineering();
     for width in [0_u16, 1, 2, 3, 4] {
-        let [name, role, state, model] = columns(width, &card.members);
-        assert!(name + role + state + model <= width, "width {width}");
+        let [name, role, state, inbox, model] = columns(width, &card.members);
+        assert!(name + role + state + inbox + model <= width, "width {width}");
     }
 }
 
@@ -378,8 +390,8 @@ fn a_one_cell_pane_produces_no_columns_rather_than_panicking() {
 /// table with no rows rather than an arithmetic fault.
 #[test]
 fn an_empty_department_allocates_no_columns_and_does_not_panic() {
-    assert_eq!(columns(200, &[]), [2, 0, 0, 0], "only the glyph a name would carry");
-    assert_eq!(columns(0, &[]), [0, 0, 0, 0]);
+    assert_eq!(columns(200, &[]), [2, 0, 0, 5, 0], "the empty table keeps its inbox header");
+    assert_eq!(columns(0, &[]), [0, 0, 0, 0, 0]);
 }
 
 /// A role longer than any pane must not make the arithmetic wrap or the table
@@ -392,7 +404,91 @@ fn an_absurdly_long_role_shrinks_rather_than_overflowing() {
         members: vec![member("A", &"r".repeat(4000), PersonState::Working, "m", false)],
         children: Vec::new(),
     };
-    let [name, role, state, model] = columns(80, &card.members);
-    assert!(name + role + state + model + COLUMN_SPACING <= 80);
+    let [name, role, state, inbox, model] = columns(80, &card.members);
+    assert!(name + role + state + inbox + model + COLUMN_SPACING <= 80);
     assert!(role > 0, "and it still draws as much of the role as it can: {role}");
+}
+
+#[test]
+fn the_inbox_column_keeps_zero_and_multi_digit_counts_right_aligned() {
+    let card = engineering();
+    let backend = TestBackend::new(100, 24);
+    let mut terminal = Terminal::new(backend).expect("terminal");
+    terminal.draw(|frame| draw(frame, &card, true)).expect("draw");
+    let buffer = terminal.backend().buffer();
+    let width = usize::from(buffer.area.width);
+    let rows: Vec<String> = buffer
+        .content
+        .chunks(width)
+        .map(|row| row.iter().map(|cell| cell.symbol()).collect())
+        .collect();
+    let header = rows.iter().find(|row| row.contains("inbox")).expect("labelled inbox column");
+    let inbox_byte = header.find("inbox").expect("inbox starts");
+    let inbox_at = header[..inbox_byte].chars().count();
+    let slice = |row: &str| row.chars().skip(inbox_at).take(5).collect::<String>();
+    let ada = rows.iter().find(|row| row.contains("Ada")).expect("Ada row");
+    let owen = rows.iter().find(|row| row.contains("Owen")).expect("Owen row");
+    assert_eq!(slice(header), "inbox");
+    assert_eq!(slice(ada), "    0", "an empty inbox is an explicit zero");
+    assert_eq!(slice(owen), "   12", "counts share one right edge");
+}
+
+#[test]
+fn the_inbox_column_never_truncates_the_decimal_answer() {
+    let mut card = engineering();
+    card.members[0].inbox_messages = 123_456;
+    assert_eq!(columns(200, &card.members)[INBOX], 6);
+    assert_eq!(columns(60, &card.members)[INBOX], 6, "the header gives way before a digit does");
+}
+
+#[test]
+fn a_rendered_inbox_count_is_whole_or_hidden_at_its_exact_width_boundary() {
+    let count = "987654";
+    let card = Card {
+        name: "Unit".to_owned(),
+        path: Vec::new(),
+        members: vec![Member {
+            name: "Zed".to_owned(),
+            role: String::new(),
+            state: PersonState::Sleeping,
+            model: String::new(),
+            inbox_messages: 987_654,
+            head: false,
+        }],
+        children: Vec::new(),
+    };
+    let mut first_visible = None;
+    for terminal_width in 14..=24_u16 {
+        let backend = TestBackend::new(terminal_width, 16);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal.draw(|frame| draw(frame, &card, true)).expect("draw");
+        let buffer = terminal.backend().buffer();
+        let width = usize::from(buffer.area.width);
+        let member_row: String = buffer
+            .content
+            .chunks(width)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .find(|row| row.contains("Zed"))
+            .expect("the member row stays visible around the inbox boundary");
+        let member_area_width = terminal_width.saturating_sub(4);
+        let inbox_width = columns(member_area_width, &card.members)[INBOX];
+        assert!(
+            inbox_width == 0 || inbox_width == 6,
+            "width {terminal_width} allocated a partial {inbox_width}-cell decimal"
+        );
+        if inbox_width == 6 {
+            assert!(
+                member_row.contains(count),
+                "width {terminal_width} allocated the count but did not draw it whole: {member_row:?}"
+            );
+            first_visible.get_or_insert(terminal_width);
+        } else {
+            assert!(
+                !count.chars().any(|digit| member_row.contains(digit)),
+                "width {terminal_width} drew a clipped count: {member_row:?}"
+            );
+        }
+    }
+    let boundary = first_visible.expect("the sweep reaches a width that can show the count");
+    assert_eq!(boundary, 19, "the count appears at the first frame that has all six cells");
 }

@@ -898,6 +898,29 @@ fn spawn_person(step: &plan::Step) -> Option<String> {
     }
 }
 
+/// Missing and unknown inbox-count owners at the display handoff.
+///
+/// The roster and launch catalog are separate HTTP reads. The launch catalog
+/// validates its count map against its OWN roster, but the brain draws the
+/// roster read by this pass. Keep that boundary explicit: a mismatch is not an
+/// empty inbox and is not launch authority.
+fn inbox_count_roster_mismatch<'a>(
+    roster_people: impl IntoIterator<Item = &'a str>,
+    inbox_counts: &BTreeMap<String, usize>,
+) -> Option<(Vec<String>, Vec<String>)> {
+    let roster: BTreeSet<&str> = roster_people.into_iter().collect();
+    let counted: BTreeSet<&str> = inbox_counts.keys().map(String::as_str).collect();
+    let missing: Vec<String> =
+        roster.difference(&counted).map(|person| (*person).to_owned()).collect();
+    let unknown: Vec<String> =
+        counted.difference(&roster).map(|person| (*person).to_owned()).collect();
+    if missing.is_empty() && unknown.is_empty() {
+        None
+    } else {
+        Some((missing, unknown))
+    }
+}
+
 impl TmuxActuator {
     /// Hand the session brain the company this pass just read.
     ///
@@ -925,6 +948,20 @@ impl TmuxActuator {
         launch: &ResolvedCatalog,
         crashing: BTreeMap<String, CrashReport>,
     ) {
+        if let Some((missing, unknown)) = inbox_count_roster_mismatch(
+            roster.people.iter().map(|person| person.id.as_str()),
+            &launch.inbox_counts,
+        ) {
+            self.brain.unreadable();
+            tracing::warn!(
+                event = "sidebar.company.inbox-counts-inconsistent",
+                company = %self.company,
+                ?missing,
+                ?unknown,
+                "the launch catalog's inbox counts do not exactly cover this pass's roster; the display was not updated"
+            );
+            return;
+        }
         let Ok(board) = self.client.lifecycle_status().await else {
             tracing::debug!(
                 event = "sidebar.company.lifecycle-unreadable",
@@ -947,6 +984,7 @@ impl TmuxActuator {
             hashes: desired.hashes(),
             accents,
             models: launch.models.clone(),
+            inbox_counts: launch.inbox_counts.clone(),
             // THE ACTUATOR'S OWN CRASH REPORT, HANDED TO THE GLASS. This
             // process is the only one that knows a person's boot keeps dying,
             // how many times, since when, and what tmux said about it. Until it
@@ -1388,6 +1426,49 @@ mod tests {
 
     use super::*;
     use crate::actuate::desired::DesiredPerson;
+
+    fn inbox_counts(people: &[&str]) -> BTreeMap<String, usize> {
+        people.iter().enumerate().map(|(count, person)| ((*person).to_owned(), count)).collect()
+    }
+
+    #[test]
+    fn exact_inbox_count_keys_cover_the_display_roster() {
+        let counts = inbox_counts(&["chief", "vera"]);
+        assert_eq!(inbox_count_roster_mismatch(["chief", "vera"], &counts), None);
+    }
+
+    #[test]
+    fn a_missing_inbox_count_is_not_an_empty_inbox() {
+        let counts = inbox_counts(&["chief"]);
+        assert_eq!(
+            inbox_count_roster_mismatch(["chief", "vera"], &counts),
+            Some((vec!["vera".to_owned()], Vec::new()))
+        );
+    }
+
+    #[test]
+    fn an_unknown_inbox_count_cannot_enter_the_display() {
+        let counts = inbox_counts(&["chief", "stranger"]);
+        assert_eq!(
+            inbox_count_roster_mismatch(["chief"], &counts),
+            Some((Vec::new(), vec!["stranger".to_owned()]))
+        );
+    }
+
+    #[test]
+    fn inbox_count_validation_is_display_only_and_placement_still_runs() {
+        let source = include_str!("resident.rs");
+        let handoff = source
+            .find("self.feed_brain(&roster, desired, &launch, crashing.clone()).await;")
+            .expect("the display handoff");
+        let placement = source[handoff..]
+            .find("crate::placement::desired_topology(&roster, &hashes, &self.session)")
+            .expect("placement follows the display handoff");
+        assert!(
+            placement > 0,
+            "the handoff returns unit to converge; an unreadable display does not block placement"
+        );
+    }
 
     fn observed_person(person: &str, organization: &str, hash: &str) -> ObservedTopology {
         ObservedTopology {

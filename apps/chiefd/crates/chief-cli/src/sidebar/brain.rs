@@ -174,6 +174,9 @@ pub struct Facts {
     pub accents: BTreeMap<String, String>,
     /// Backend-owned current model facts by person id.
     pub models: BTreeMap<String, crate::actuate::launch_catalog::PersonModel>,
+    /// Durable inbox-message counts by person id. Every roster person has one,
+    /// including a person whose launch gate is refused.
+    pub inbox_counts: BTreeMap<String, usize>,
     /// Whose boot the ACTUATOR keeps retrying because it keeps dying, and the
     /// numbers the operator reads about it.
     ///
@@ -642,6 +645,7 @@ pub struct Brain {
     accents: BTreeMap<String, String>,
     /// Backend-owned model facts last read with the launch catalog.
     models: BTreeMap<String, crate::actuate::launch_catalog::PersonModel>,
+    inbox_counts: BTreeMap<String, usize>,
     /// The operator's LATEST gesture, for converge's own line.
     gesture: Option<u64>,
     /// Every attached thin client.
@@ -704,6 +708,7 @@ impl Brain {
             expanded_columns,
             accents: BTreeMap::new(),
             models: BTreeMap::new(),
+            inbox_counts: BTreeMap::new(),
             gesture: None,
             clients: BTreeMap::new(),
             decoders: BTreeMap::new(),
@@ -758,7 +763,17 @@ impl Brain {
 
     fn absorb(&mut self, facts: Facts) {
         let first_company_read = !self.view.is_read();
-        let Facts { roster, desired, idle, hashes, accents, models, crashing, refusals } = facts;
+        let Facts {
+            roster,
+            desired,
+            idle,
+            hashes,
+            accents,
+            models,
+            inbox_counts,
+            crashing,
+            refusals,
+        } = facts;
         let live = effects::live_person_ids(self.tmux.as_ref(), &self.session);
         let unseen_expired = self.watch_unseen_waking(&roster.company.slug, &desired, &live);
         if let Some(parked) = effects::park_orphan_waking_focus(
@@ -788,6 +803,7 @@ impl Brain {
         let (names, roles) = roster_presentations(&roster);
         self.accents = accents;
         self.models = models;
+        self.inbox_counts = inbox_counts;
         // EVERY RAIL IN THE SESSION, not just one. There is one brain and N
         // rails now, so the process that knows the company is the process that
         // has to title all of their borders — and the accents are kept so a
@@ -1656,14 +1672,11 @@ impl Brain {
             .filter(|candidate| candidate.depth == row.depth + 1)
             .map(|candidate| candidate.name.clone())
             .collect();
-        let members = self
-            .view
-            .everybody()
-            .get(department_id)
-            .map(|people| {
-                people
-                    .iter()
-                    .map(|person| super::department_card::Member {
+        let members = match self.view.everybody().get(department_id) {
+            Some(people) => people
+                .iter()
+                .map(|person| {
+                    Some(super::department_card::Member {
                         name: person.name.clone(),
                         role: person.title.clone(),
                         state: person.state(),
@@ -1672,11 +1685,13 @@ impl Brain {
                             .get(&person.id)
                             .map(crate::actuate::launch_catalog::PersonModel::label)
                             .unwrap_or_default(),
+                        inbox_messages: self.inbox_counts.get(&person.id).copied()?,
                         head: person.manager,
                     })
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+                })
+                .collect::<Option<Vec<_>>>()?,
+            None => Vec::new(),
+        };
         let card = super::department_card::Card { name: row.name.clone(), path, members, children };
         let payload = serde_json::to_string(&card).ok()?;
         Some(vec![program, "department-card".to_owned(), payload])

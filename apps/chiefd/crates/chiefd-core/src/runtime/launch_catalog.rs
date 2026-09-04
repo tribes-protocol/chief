@@ -212,6 +212,15 @@ pub struct LaunchCatalog {
     pub roster: Vec<String>,
     /// Current model facts for every validated roster person.
     pub models: BTreeMap<String, PersonModel>,
+    /// Messages in the inbox view for every person in [`Self::roster`].
+    ///
+    /// This is a top-level roster fact because a person whose launch gate is
+    /// refused still has an inbox and must still appear on the department
+    /// card. `pending` and fence-archived `delivered` rows are in that view;
+    /// the four pane-drain states are not. The route that owns the company
+    /// mailbox supplies the exact count; the pure builder initializes every
+    /// roster person to zero.
+    pub inbox_counts: BTreeMap<String, usize>,
     /// The people the on-disk gate ADMITTED, keyed by person id.
     pub people: BTreeMap<String, LaunchEntry>,
     /// Why each person in `roster` but not in `people` was declined, re-derived
@@ -237,6 +246,7 @@ impl LaunchCatalog {
             company: company.into(),
             roster: Vec::new(),
             models: BTreeMap::new(),
+            inbox_counts: BTreeMap::new(),
             people: BTreeMap::new(),
             refusals: BTreeMap::new(),
         }
@@ -313,6 +323,8 @@ mod tests {
             PersonModel::selected("openai".to_owned(), "gpt-5.6".to_owned()),
         );
         catalog.models.insert("nolan".to_owned(), PersonModel::unavailable(None, None));
+        catalog.inbox_counts.insert("vera".to_owned(), 12);
+        catalog.inbox_counts.insert("nolan".to_owned(), 0);
         catalog.people.insert("vera".to_owned(), entry());
         catalog
             .refusals
@@ -356,6 +368,8 @@ mod tests {
         // decoding `session` strictly must find the key.
         assert!(vera["session"].is_null());
         assert_eq!(vera["pendingMail"], true, "the client decodes this field strictly");
+        assert_eq!(body["inboxCounts"]["vera"], 12);
+        assert_eq!(body["inboxCounts"]["nolan"], 0);
         assert_eq!(vera["piHome"], "/data/cobalt/.chief/agent/vera");
         assert_eq!(vera["env"][0]["name"], "ORG_LAUNCHER_ORGANIZATION");
         assert_eq!(vera["env"][0]["value"], "cobalt");
