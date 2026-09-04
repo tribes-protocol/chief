@@ -65,6 +65,7 @@ use chiefd_core::runtime::launch_catalog::LaunchCatalog;
 use chiefd_core::runtime::launch_hash::{desired_launch_hash, LaunchInputs};
 use chiefd_core::runtime::roster::project_desired_roster;
 use chiefd_core::store::converge_safety::ConvergeSafetyState;
+use chiefd_core::store::mailbox::MailboxState;
 
 use super::org_slice::{failed, live, Refused, SlugRequest};
 use super::router::SupervisionLiveSource;
@@ -383,24 +384,215 @@ pub(crate) async fn org_runtime_launch_catalog(
     // the same fail-open the pending-mail projection already refuses to make
     // ("an unobservable store must not silently read as 'no demand anywhere'").
     let (mailbox, _seq) = source.company.mailbox_read().await.map_err(|error| failed(&error))?;
-    let people_with_pending_mail: std::collections::BTreeSet<String> = mailbox
+    let typed_mailbox = mailbox
         .entries
-        .into_iter()
-        .filter(|entry| entry.state == "pending")
-        .map(|entry| entry.person)
-        .collect();
-    Ok(Json(chiefd_host::converge_apply::build_launch_catalog_for_session_epoch(
+        .iter()
+        .map(|entry| {
+            MailboxState::parse(&entry.state)
+                .map(|state| (entry.person.as_str(), state))
+                .ok_or_else(|| {
+                    Refused::fault(
+                        "mailbox-state-unreadable",
+                        format!(
+                            "mailbox entry '{}' has unknown state '{}'",
+                            entry.envelope_id(),
+                            entry.state
+                        ),
+                    )
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let (people_with_pending_mail, inbox_counts) =
+        mailbox_facts(&manifest.people_order, typed_mailbox);
+    let mut catalog = chiefd_host::converge_apply::build_launch_catalog_for_session_epoch(
         &manifest,
         config,
         session_epoch,
         &identity_refusals,
         &people_with_pending_mail,
-    )))
+    );
+    catalog.inbox_counts = inbox_counts;
+    Ok(Json(catalog))
+}
+
+/// Derive the two mailbox facts the launch catalog publishes from one durable
+/// snapshot. Launch demand is only a `pending` row. The operator-facing inbox
+/// view also includes a fence-archived `delivered` row, which is the same rule
+/// the person's own footer uses. The four pane-drain states are excluded.
+fn mailbox_facts<'a>(
+    roster: &[String],
+    entries: impl IntoIterator<Item = (&'a str, MailboxState)>,
+) -> (std::collections::BTreeSet<String>, std::collections::BTreeMap<String, usize>) {
+    let mut pending_people = std::collections::BTreeSet::new();
+    let mut inbox_counts: std::collections::BTreeMap<String, usize> =
+        roster.iter().map(|person| (person.clone(), 0)).collect();
+    for (person, state) in entries {
+        let known = inbox_counts.contains_key(person);
+        if known && state.supplies_launch_demand() {
+            pending_people.insert(person.to_owned());
+        }
+        if known && state.is_inbox_message() {
+            if let Some(count) = inbox_counts.get_mut(person) {
+                *count += 1;
+            }
+        }
+    }
+    (pending_people, inbox_counts)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn mailbox_entry(
+        id: &str,
+        person: &str,
+        state: MailboxState,
+    ) -> chiefd_core::store::mailbox_rows::MailboxEntry {
+        chiefd_core::store::mailbox_rows::MailboxEntry {
+            envelope: chiefd_core::store::mailbox::MailboxEnvelope {
+                schema_version: chiefd_core::store::mailbox::MAILBOX_ENVELOPE_SCHEMA_VERSION,
+                id: id.to_owned(),
+                organization: "northstar-conformance".to_owned(),
+                from_person_id: "chief".to_owned(),
+                to: person.to_owned(),
+                recipients: vec![person.to_owned()],
+                body: format!("message {id}"),
+                urgency: chiefd_core::store::mailbox::Urgency::Normal,
+                reply_to: None,
+                health_incident: None,
+                created_at: "2026-07-15T12:00:00.000Z".to_owned(),
+            },
+            person: person.to_owned(),
+            state: state.as_str().to_owned(),
+            updated_at: 1_784_116_800_000,
+            extra: std::collections::BTreeMap::new(),
+        }
+    }
+
+    fn admit_launch_subject(dir: &std::path::Path, person_id: &str) {
+        let home = chiefd_host::agent_home::agent_home(dir, person_id);
+        std::fs::create_dir_all(home.join("sessions")).expect("sessions");
+        std::fs::create_dir_all(home.join(".pi/skills")).expect("project skills");
+        std::os::unix::fs::symlink("../../../../skills", home.join(".pi/skills/worker"))
+            .expect("role skill link");
+    }
+
+    /// The real route joins one real mailbox snapshot to the launch catalog.
+    /// Delivered mail remains visible but cannot change the launch sentence.
+    #[tokio::test]
+    async fn the_launch_catalog_route_keeps_inbox_visibility_separate_from_launch_demand() {
+        use chiefd_core::actor::{CompanyDb, MutationClass, MutationName};
+        use chiefd_core::clock::SystemClock;
+        use chiefd_core::store::{activity, organization, supervision};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let company = std::sync::Arc::new(
+            CompanyDb::open(
+                "northstar-conformance",
+                &dir.path().join("company.db"),
+                std::sync::Arc::new(SystemClock::default()),
+            )
+            .expect("company"),
+        );
+        let manifest = chiefd_core::test_support::northstar_manifest(1_784_116_800_000);
+        let seeded = manifest.clone();
+        company
+            .mutate(MutationClass::Normal, MutationName("test.seed"), move |ledgers| {
+                organization::create(ledgers, &seeded)?;
+                supervision::seed(ledgers, &seeded)?;
+                activity::seed(ledgers, &seeded)?;
+                Ok(())
+            })
+            .await
+            .expect("seed company");
+
+        let chief = "chief";
+        let delivered_only = "quant-head";
+        admit_launch_subject(dir.path(), delivered_only);
+        let operator = dir.path().join("pi-agent");
+        chiefd_host::files::publish_atomically(&operator.join("auth.json"), "{}", 0o600)
+            .expect("operator provider credential");
+        let mint = chiefd_host::identity_key::host_identity_key_mint();
+        for (person, outcome) in chiefd_host::identity_enrolment::provision_people(
+            &company,
+            dir.path(),
+            chief,
+            [chief.to_owned(), delivered_only.to_owned()],
+            &mint,
+        )
+        .await
+        {
+            assert!(outcome.is_authenticable(), "{person} identity: {outcome:?}");
+        }
+
+        company
+            .mailbox_publish(chiefd_core::store::mailbox_rows::MailboxSnapshot {
+                entries: vec![
+                    mailbox_entry("pending", chief, MailboxState::Pending),
+                    mailbox_entry("fence-archive", chief, MailboxState::Delivered),
+                    mailbox_entry("delivered-only", delivered_only, MailboxState::Delivered),
+                    mailbox_entry("settled", "signal-researcher", MailboxState::Accepted),
+                ],
+            })
+            .await
+            .expect("publish mailbox rows");
+
+        let source = SupervisionLiveSource::new(
+            std::sync::Arc::clone(&company),
+            "northstar-conformance".to_owned(),
+        )
+        .with_reconcile_actuator_config(chiefd_host::converge_apply::ActuatorConfig {
+            socket: "test-socket".to_owned(),
+            watching_since: "1970-01-01T00:00:00.000Z".to_owned(),
+            dir: dir.path().to_path_buf(),
+            home: dir.path().to_path_buf(),
+            pi_binary: dir.path().join("pi"),
+            floor: std::time::Duration::ZERO,
+            launcher_root: dir.path().to_path_buf(),
+            root_pi_agent_dir: operator,
+        });
+        let Json(catalog) = org_runtime_launch_catalog(
+            Extension(Some(source)),
+            Json(SlugRequest { slug: "northstar-conformance".to_owned() }),
+        )
+        .await
+        .expect("route answer");
+
+        assert_eq!(catalog.inbox_counts[chief], 2);
+        assert_eq!(catalog.inbox_counts[delivered_only], 1);
+        assert_eq!(catalog.inbox_counts["signal-researcher"], 0);
+        assert_eq!(catalog.inbox_counts["it-head"], 0);
+        assert!(catalog.people[chief].pending_mail, "pending mail supplies launch demand");
+        assert!(
+            !catalog.people[delivered_only].pending_mail,
+            "delivered-only mail stays visible without supplying launch demand"
+        );
+    }
+
+    /// Inbox is the durable VIEW, not only launch demand: a fence-archived
+    /// delivered row stays visible. Every roster person gets an explicit zero,
+    /// and a stale row for an unknown person cannot add a card fact for somebody
+    /// the roster does not contain.
+    #[test]
+    fn inbox_counts_include_pending_and_delivered_for_every_roster_person() {
+        let roster = vec!["vera".to_owned(), "nolan".to_owned(), "rhea".to_owned()];
+        let (pending, inbox) = mailbox_facts(
+            &roster,
+            [
+                ("vera", MailboxState::Pending),
+                ("vera", MailboxState::Delivered),
+                ("vera", MailboxState::Accepted),
+                ("nolan", MailboxState::Delivered),
+                ("unknown", MailboxState::Pending),
+            ],
+        );
+        assert_eq!(pending, ["vera".to_owned()].into_iter().collect());
+        assert_eq!(inbox["vera"], 2, "pending and delivered are both still in the inbox");
+        assert_eq!(inbox["nolan"], 1, "a delivered row remains visible");
+        assert_eq!(inbox["rhea"], 0, "an empty inbox is explicit");
+        assert!(!inbox.contains_key("unknown"), "only roster people get card facts");
+    }
 
     /// A surface with no actuator configuration says so, in a code a client can
     /// act on — it never answers an empty catalog. An empty catalog would be a

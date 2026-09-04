@@ -145,7 +145,10 @@ pub const LAUNCH_CATALOG_BUDGET: Duration = Duration::from_secs(20);
 ///   runtime identity a restart is fenced on.
 /// * `converge-safety` — shadow/apply, the breaker, the budgets.
 /// * `org-manifest` — the structural authority: people, departments, the tree.
-pub const WAKE_STORES: [&str; 4] = ["activity", "supervision", "converge-safety", "org-manifest"];
+/// * `mailbox/` — every per-person inbox; a drain changes the card count even
+///   when no runtime authority changes with it.
+pub const WAKE_STORES: [&str; 5] =
+    ["activity", "supervision", "converge-safety", "org-manifest", "mailbox/"];
 
 /// How long a wake waits for the rest of its burst before it is answered.
 ///
@@ -1072,7 +1075,7 @@ mod tests {
             !WAKE_STORES.contains(&"runtime-actuation"),
             "the actuation store is deleted; nothing may subscribe to it"
         );
-        for expected in ["activity", "supervision", "converge-safety", "org-manifest"] {
+        for expected in ["activity", "supervision", "converge-safety", "org-manifest", "mailbox/"] {
             assert!(WAKE_STORES.contains(&expected), "{expected} is work somebody else commits");
         }
     }
@@ -1251,7 +1254,7 @@ mod tests {
         assert_eq!(client.document_key(), "acme@abc123");
         assert_eq!(
             client.watch_url(Some(3)),
-            "http://127.0.0.1:8791/v1/docs/watch?slug=acme@abc123&stores=activity,supervision,converge-safety,org-manifest&after=3",
+            "http://127.0.0.1:8791/v1/docs/watch?slug=acme@abc123&stores=activity,supervision,converge-safety,org-manifest,mailbox/&after=3",
             "a trailing slash on the base must never double the separator"
         );
         // A3: this actuator is its OWN principal. It never borrows the

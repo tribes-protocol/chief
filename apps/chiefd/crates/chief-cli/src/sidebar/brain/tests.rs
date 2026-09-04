@@ -166,6 +166,10 @@ fn placement_of_a_two_person_quant() -> (crate::roster::Roster, BTreeMap<String,
     (roster, hashes)
 }
 
+fn empty_inbox_counts(roster: &crate::roster::Roster) -> BTreeMap<String, usize> {
+    roster.people.iter().map(|person| (person.id.clone(), 0)).collect()
+}
+
 /// A retained two-window company used to pin the brain's first selection.
 fn retained_company_facts() -> Facts {
     use crate::roster::{Roster, RosterCompany, RosterDepartment, RosterPerson};
@@ -179,35 +183,38 @@ fn retained_company_facts() -> Facts {
         desired_active: true,
         employment_state: "active".to_owned(),
     };
+    let roster = Roster {
+        company: RosterCompany { slug: "acme".to_owned(), display_name: "Acme".to_owned() },
+        root_department_id: "executive".to_owned(),
+        departments: vec![
+            RosterDepartment {
+                id: "executive".to_owned(),
+                name: "Executive".to_owned(),
+                parent_department_id: None,
+                head_person_id: "chief".to_owned(),
+                order: 0,
+                state: "active".to_owned(),
+            },
+            RosterDepartment {
+                id: "quant".to_owned(),
+                name: "Quant".to_owned(),
+                parent_department_id: Some("executive".to_owned()),
+                head_person_id: "analyst".to_owned(),
+                order: 1,
+                state: "active".to_owned(),
+            },
+        ],
+        people: vec![person(0, "chief", "executive"), person(1, "analyst", "quant")],
+    };
+    let inbox_counts = empty_inbox_counts(&roster);
     Facts {
-        roster: Roster {
-            company: RosterCompany { slug: "acme".to_owned(), display_name: "Acme".to_owned() },
-            root_department_id: "executive".to_owned(),
-            departments: vec![
-                RosterDepartment {
-                    id: "executive".to_owned(),
-                    name: "Executive".to_owned(),
-                    parent_department_id: None,
-                    head_person_id: "chief".to_owned(),
-                    order: 0,
-                    state: "active".to_owned(),
-                },
-                RosterDepartment {
-                    id: "quant".to_owned(),
-                    name: "Quant".to_owned(),
-                    parent_department_id: Some("executive".to_owned()),
-                    head_person_id: "analyst".to_owned(),
-                    order: 1,
-                    state: "active".to_owned(),
-                },
-            ],
-            people: vec![person(0, "chief", "executive"), person(1, "analyst", "quant")],
-        },
+        roster,
         desired: ["chief".to_owned(), "analyst".to_owned()].into_iter().collect(),
         idle: BTreeSet::new(),
         hashes: BTreeMap::new(),
         accents: BTreeMap::new(),
         models: BTreeMap::new(),
+        inbox_counts,
         crashing: BTreeMap::new(),
         refusals: BTreeMap::new(),
     }
@@ -473,6 +480,10 @@ fn brain_against<T: Tmux + 'static>(
     let (mut brain, events) =
         Brain::new(tmux, client, "org-acme_".to_owned(), PathBuf::from("/company"));
     brain.view = view_of_one_sleeper();
+    brain.inbox_counts =
+        [("chief".to_owned(), 0), ("quant-head".to_owned(), 0), ("analyst".to_owned(), 0)]
+            .into_iter()
+            .collect();
     if placed {
         brain.placement = Some(placement_of_a_two_person_quant());
     }
@@ -483,6 +494,7 @@ fn brain_against<T: Tmux + 'static>(
 
 fn sleeper_facts(desired: &[&str]) -> Facts {
     let (roster, hashes) = placement_of_a_two_person_quant();
+    let inbox_counts = empty_inbox_counts(&roster);
     Facts {
         roster,
         desired: desired.iter().map(|person| (*person).to_owned()).collect(),
@@ -490,6 +502,7 @@ fn sleeper_facts(desired: &[&str]) -> Facts {
         hashes,
         accents: BTreeMap::new(),
         models: BTreeMap::new(),
+        inbox_counts,
         crashing: BTreeMap::new(),
         refusals: BTreeMap::new(),
     }
@@ -764,6 +777,7 @@ async fn a_department_row_shows_its_department_and_never_hijacks_to_its_manager(
         }],
         people,
     );
+    brain.inbox_counts = [("analyst".to_owned(), 0)].into_iter().collect();
 
     brain.perform(
         Action::SelectDepartment("quant".to_owned()),
@@ -1610,6 +1624,10 @@ async fn a_department_card_carries_the_units_own_people_and_never_another_units(
         ],
         people,
     );
+    brain.inbox_counts =
+        [("chief".to_owned(), 0), ("quant-head".to_owned(), 0), ("analyst".to_owned(), 12)]
+            .into_iter()
+            .collect();
 
     let launch = brain.department_card_launch("quant").expect("the card builds from the roster");
     let payload = launch.last().expect("the payload is the last argument");
@@ -1625,6 +1643,11 @@ async fn a_department_card_carries_the_units_own_people_and_never_another_units(
     );
     let names: Vec<&str> = card.members.iter().map(|member| member.name.as_str()).collect();
     assert_eq!(names, ["Quinn", "Ana"], "this unit's people, in roster order");
+    assert_eq!(
+        card.members.iter().map(|member| member.inbox_messages).collect::<Vec<_>>(),
+        [0, 12],
+        "the durable inbox count follows each person into the serialized card"
+    );
     assert!(
         !names.contains(&"Chief"),
         "and NEVER another unit's — a card that borrowed the root's people is the \
@@ -1849,6 +1872,42 @@ fn a_company_read_that_changes_a_state_repaints_the_card_in_place() {
         repaints[0].contains("department-card"),
         "running the card program, not a notice: {}",
         repaints[0]
+    );
+}
+
+/// A mailbox row can move without a roster or runtime fact moving with it.
+/// That one durable count must refresh the card once, in place, and the same
+/// count on the next pass must be silent.
+#[test]
+fn an_inbox_count_change_repaints_the_card_once() {
+    let (mut brain, tmux) = brain_watching_the_quant_card();
+    let settled = tmux.calls().len();
+    let mut facts = retained_company_facts();
+    facts.inbox_counts.insert("analyst".to_owned(), 12);
+
+    brain.absorb(facts.clone());
+
+    let calls = tmux.calls();
+    let changed: Vec<&String> =
+        calls[settled..].iter().filter(|call| call.contains("respawn-pane")).collect();
+    assert_eq!(changed.len(), 1, "only Quant changed: {changed:?}");
+    assert!(changed[0].contains("respawn-pane -k -t %8"), "the same card pane is reused");
+    assert!(
+        changed[0].contains(r#""inbox_messages":12"#),
+        "the new count reaches the payload: {}",
+        changed[0]
+    );
+    assert!(
+        !changed[0].contains("select-layout") && !changed[0].contains("select-window"),
+        "a count refresh does not move the glass: {}",
+        changed[0]
+    );
+
+    let once = tmux.calls().len();
+    brain.absorb(facts);
+    assert!(
+        !tmux.calls()[once..].iter().any(|call| call.contains("respawn-pane")),
+        "the same count does not repaint twice"
     );
 }
 
@@ -2498,13 +2557,16 @@ async fn sleeper_selection_marks_nobody_starting_before_a_button_action() {
     );
 
     // The company is read again. Selection is still not a wake action.
+    let roster = placement_of_a_two_person_quant().0;
+    let inbox_counts = empty_inbox_counts(&roster);
     brain.absorb(Facts {
-        roster: placement_of_a_two_person_quant().0,
+        roster,
         desired: BTreeSet::new(),
         idle: BTreeSet::new(),
         hashes: BTreeMap::new(),
         accents: BTreeMap::new(),
         models: BTreeMap::new(),
+        inbox_counts,
         crashing: BTreeMap::new(),
         refusals: BTreeMap::new(),
     });

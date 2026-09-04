@@ -57,6 +57,23 @@ impl WakeDecider for InFlight {
     }
 }
 
+#[test]
+fn inbox_visibility_and_launch_demand_are_different_typed_rules() {
+    assert!(MailboxState::Pending.is_inbox_message());
+    assert!(MailboxState::Pending.supplies_launch_demand());
+    assert!(MailboxState::Delivered.is_inbox_message());
+    assert!(!MailboxState::Delivered.supplies_launch_demand());
+    for state in [
+        MailboxState::Accepted,
+        MailboxState::Superseded,
+        MailboxState::Rejected,
+        MailboxState::Resolved,
+    ] {
+        assert!(!state.is_inbox_message(), "{state:?} is settled");
+        assert!(!state.supplies_launch_demand(), "{state:?} cannot launch a person");
+    }
+}
+
 // --- enqueue: durable, idempotent, content-fenced ---------------------------
 
 #[test]

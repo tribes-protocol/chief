@@ -144,6 +144,31 @@ impl MailboxState {
         }
     }
 
+    /// Whether this row still appears in the recipient's durable inbox view.
+    ///
+    /// `Delivered` is the fence archive: it no longer supplies launch demand,
+    /// but it stays in the inbox view.
+    #[must_use]
+    pub const fn is_inbox_message(self) -> bool {
+        match self {
+            Self::Pending | Self::Delivered => true,
+            Self::Accepted | Self::Superseded | Self::Rejected | Self::Resolved => false,
+        }
+    }
+
+    /// Whether this row supplies pending-mail launch demand.
+    #[must_use]
+    pub const fn supplies_launch_demand(self) -> bool {
+        match self {
+            Self::Pending => true,
+            Self::Delivered
+            | Self::Accepted
+            | Self::Superseded
+            | Self::Rejected
+            | Self::Resolved => false,
+        }
+    }
+
     /// Whether this bucket is a terminal (archive) state.
     #[must_use]
     pub const fn is_terminal(self) -> bool {

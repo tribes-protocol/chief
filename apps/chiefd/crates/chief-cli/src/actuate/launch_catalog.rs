@@ -209,6 +209,8 @@ pub struct LaunchCatalog {
     pub roster: Vec<String>,
     /// Current model facts for every validated roster person.
     pub models: BTreeMap<String, PersonModel>,
+    /// Messages in the durable inbox view, for every roster person.
+    pub inbox_counts: BTreeMap<String, usize>,
     /// The people the on-disk gate ADMITTED.
     pub people: BTreeMap<String, LaunchEntry>,
     /// Why each person in `roster` but not in `people` was declined.
@@ -232,10 +234,22 @@ impl LaunchCatalog {
                 catalog.schema_version
             )));
         }
+        let roster: BTreeSet<&str> = catalog.roster.iter().map(String::as_str).collect();
+        if roster.len() != catalog.roster.len() {
+            return Err(<serde_json::Error as serde::de::Error>::custom(
+                "launch catalog roster contains duplicate person ids",
+            ));
+        }
+        let counted: BTreeSet<&str> = catalog.inbox_counts.keys().map(String::as_str).collect();
+        if counted != roster {
+            return Err(<serde_json::Error as serde::de::Error>::custom(format!(
+                "launch catalog inboxCounts must name every roster person exactly; roster={roster:?}, counts={counted:?}"
+            )));
+        }
         Ok(catalog)
     }
 
-    /// Turn the wire body into the three values the interpreter wants.
+    /// Turn the wire body into the facts the interpreter wants.
     ///
     /// Done ONCE per pass rather than per step: `LaunchSpec` owns its strings,
     /// and rebuilding the whole map for every start in a plan would re-clone
@@ -275,6 +289,7 @@ impl LaunchCatalog {
             specs,
             roster: self.roster.iter().cloned().collect(),
             models: self.models.clone(),
+            inbox_counts: self.inbox_counts.clone(),
             refusals,
         }
     }
@@ -295,6 +310,8 @@ pub struct ResolvedCatalog {
     pub roster: BTreeSet<String>,
     /// Backend-owned current model facts by person id.
     pub models: BTreeMap<String, PersonModel>,
+    /// Durable inbox-message counts by person id, including refused people.
+    pub inbox_counts: BTreeMap<String, usize>,
     /// chiefd's own re-derived reason for each declined person.
     pub refusals: BTreeMap<String, String>,
 }
@@ -306,7 +323,7 @@ mod tests {
     #[test]
     fn the_retired_launch_catalog_schema_is_refused_without_a_compatibility_arm() {
         let error = LaunchCatalog::from_json(
-            r#"{"schemaVersion":1,"company":"acme","roster":[],"people":{},"models":{},"refusals":{}}"#,
+            r#"{"schemaVersion":1,"company":"acme","roster":[],"people":{},"models":{},"inboxCounts":{},"refusals":{}}"#,
         )
         .expect_err("schema 1 is retired");
         assert!(error.to_string().contains("expected 2"));
@@ -332,6 +349,7 @@ mod tests {
         "vera": {"state":"selected","provider":"openai","model":"gpt-5.6"},
         "nolan": {"state":"unavailable","provider":null,"model":null}
       },
+      "inboxCounts": {"vera":12,"nolan":0},
       "people": {
         "vera": {
           "piBinary": "/opt/pi/bin/pi",
@@ -373,8 +391,36 @@ mod tests {
         assert_eq!(catalog.models["vera"].state, PersonModelState::Selected);
         assert_eq!(catalog.models["vera"].provider.as_deref(), Some("openai"));
         assert_eq!(catalog.models["vera"].model.as_deref(), Some("gpt-5.6"));
+        assert_eq!(catalog.inbox_counts["vera"], 12);
+        assert_eq!(catalog.inbox_counts["nolan"], 0);
         assert_eq!(catalog.people.len(), 1, "only the admitted person carries an entry");
         assert_eq!(catalog.refusals["nolan"], "required directory 'workspace' is missing");
+    }
+
+    #[test]
+    fn inbox_counts_name_every_roster_person_including_a_refusal() {
+        let mut missing: serde_json::Value = serde_json::from_str(BODY).expect("fixture JSON");
+        missing["inboxCounts"].as_object_mut().expect("count map").remove("nolan");
+        let error = LaunchCatalog::from_json(&serde_json::to_string(&missing).expect("JSON"))
+            .expect_err("a refused person still needs an inbox count");
+        assert!(error.to_string().contains("inboxCounts must name every roster person exactly"));
+
+        let mut unknown: serde_json::Value = serde_json::from_str(BODY).expect("fixture JSON");
+        unknown["inboxCounts"]["stranger"] = serde_json::json!(1);
+        let error = LaunchCatalog::from_json(&serde_json::to_string(&unknown).expect("JSON"))
+            .expect_err("an unknown person cannot enter the card through the count map");
+        assert!(error.to_string().contains("inboxCounts must name every roster person exactly"));
+    }
+
+    #[test]
+    fn duplicate_roster_ids_are_refused_before_they_collapse_into_a_set() {
+        let mut duplicate: serde_json::Value = serde_json::from_str(BODY).expect("fixture JSON");
+        duplicate["roster"] = serde_json::json!(["vera", "nolan", "vera"]);
+
+        let error = LaunchCatalog::from_json(&serde_json::to_string(&duplicate).expect("JSON"))
+            .expect_err("one person cannot occupy two roster positions");
+
+        assert!(error.to_string().contains("roster contains duplicate person ids"));
     }
 
     /// Every field, because a field this client silently dropped would be a

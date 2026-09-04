@@ -542,6 +542,47 @@ fn build_launch_catalog_admits_the_materialized_and_refuses_the_rest_in_one_answ
         assert!(!catalog.people.contains_key(person_id));
         assert!(catalog.refusal(person_id).is_some(), "{person_id} must be refused by name");
     }
+    let zero_counts: std::collections::BTreeMap<String, usize> =
+        manifest.people_order.iter().cloned().map(|person| (person, 0)).collect();
+    assert_eq!(
+        catalog.inbox_counts, zero_counts,
+        "every roster person gets an exact zero, including people the launch gate refused"
+    );
+}
+
+#[test]
+fn pending_mail_marks_only_the_admitted_person_named_by_the_builder_input() {
+    let manifest = northstar_manifest(EPOCH);
+    let company_dir = tempfile::tempdir().expect("tempdir");
+    let with_pending_mail = manifest.people_order.first().expect("first roster person").clone();
+    let without_pending_mail = manifest.people_order.get(1).expect("second roster person").clone();
+    admit_launch_subject(company_dir.path(), &with_pending_mail);
+    admit_launch_subject(company_dir.path(), &without_pending_mail);
+    let mut config = config();
+    config.dir = company_dir.path().to_path_buf();
+    config.root_pi_agent_dir = operator_pi_agent_dir(company_dir.path());
+    let pending = std::collections::BTreeSet::from([with_pending_mail.clone()]);
+
+    let catalog = crate::converge_apply::build_launch_catalog_for_session_epoch(
+        &manifest,
+        &config,
+        None,
+        &std::collections::BTreeMap::new(),
+        &pending,
+    );
+
+    assert!(
+        catalog.people.get(&with_pending_mail).expect("pending person is admitted").pending_mail,
+        "the pending set must create launch demand for its admitted person"
+    );
+    assert!(
+        !catalog
+            .people
+            .get(&without_pending_mail)
+            .expect("non-pending person is admitted")
+            .pending_mail,
+        "an admitted person outside the pending set must not get launch demand"
+    );
 }
 
 /// The `reconcile.people.withheld` line must never render a reason list it does
