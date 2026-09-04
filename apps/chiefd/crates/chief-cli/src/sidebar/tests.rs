@@ -2951,7 +2951,7 @@ fn a_stale_focus_mint_uses_the_active_window_and_keeps_the_rail_at_26() {
     let tmux = RecordingTmux::answering(&[
         ("list-windows -t org-acme_", "@0\texecutive"),
         ("display-message -p -t org-acme_ -F #{window_width}", "240\t55\texecutive"),
-        ("new-window -d", "@7"),
+        ("'new-window' '-d'", "@7"),
         ("list-panes -t @7", "%80\t\t0"),
         (COLUMNS_OPTION, "26"),
         ("split-window -h -b -l 26", "%90"),
@@ -2965,7 +2965,7 @@ fn a_stale_focus_mint_uses_the_active_window_and_keeps_the_rail_at_26() {
 
     assert_eq!(effects::ensure_focus_window(&tmux, "org-acme_", &parked), Some("@7".into()));
     let calls = tmux.calls();
-    assert_eq!(calls.iter().filter(|call| call.starts_with("new-window")).count(), 1);
+    assert_eq!(calls.iter().filter(|call| call.contains("new-window")).count(), 1);
     assert_eq!(calls.iter().filter(|call| call.starts_with("split-window")).count(), 1);
     assert!(calls.iter().any(|call| call.contains("split-window -h -b -l 26")));
     let repair = calls
@@ -3150,18 +3150,27 @@ fn a_session_with_no_focus_window_mints_exactly_one_parked_one() {
 
     assert_eq!(window.as_deref(), Some("@7"));
     let calls = tmux.calls();
-    let minted = calls.iter().find(|call| call.starts_with("new-window")).expect("the mint");
+    let minted = calls.iter().find(|call| call.contains("new-window")).expect("the mint");
+    assert!(
+        minted.starts_with("if-shell -F -t org-acme_")
+            && minted.contains("#{W:#{?#{==:#{@organization_window_id},__focus__},1,}}")
+            && minted.contains("#{==:#{W:")
+            && minted.contains("'new-window'")
+            && minted.contains("'@organization_window_id' '__focus__'")
+            && minted.contains("'@chief_asleep_for' '__focus__'"),
+        "absence is checked by tmux and the complete identity is published in that same queue: {minted}"
+    );
     assert!(
         minted.contains("-d") && minted.contains("-a") && minted.contains("org-acme_:$"),
         "DETACHED, so the glass never moves, and appended LAST so no index shuffles: \
          {minted}"
     );
     assert!(
-        calls.iter().any(|call| call.contains("@organization_window_id __focus__")),
+        calls.iter().any(|call| call.contains("'@organization_window_id' '__focus__'")),
         "the window carries the logical id converge audits it by: {calls:?}"
     );
     assert!(
-        calls.iter().any(|call| call.contains("@chief_asleep_for __focus__")),
+        calls.iter().any(|call| call.contains("'@chief_asleep_for' '__focus__'")),
         "and its one pane is tagged as the rail's own FURNITURE — never as a person, \
          which converge would adopt: {calls:?}"
     );
@@ -4482,6 +4491,577 @@ impl Tmux for SocketTmux {
             .map(|out| String::from_utf8_lossy(&out.stdout).trim_end().to_owned())
             .unwrap_or_default()
     }
+}
+
+struct FirstWindowReadTmux {
+    inner: SocketTmux,
+    first: std::sync::atomic::AtomicBool,
+    replacement: Option<String>,
+    gate: Option<std::sync::Arc<std::sync::Barrier>>,
+}
+
+impl Tmux for FirstWindowReadTmux {
+    fn run(&self, args: &[&str]) -> String {
+        let first_focus_read = args.first() == Some(&"list-windows")
+            && args.last().is_some_and(|format| format.contains(tags::WINDOW))
+            && self.first.swap(false, std::sync::atomic::Ordering::SeqCst);
+        let answer = self.inner.run(args);
+        if first_focus_read {
+            if let Some(gate) = &self.gate {
+                gate.wait();
+            }
+            return self.replacement.clone().unwrap_or(answer);
+        }
+        answer
+    }
+}
+
+struct MutatingDuplicateTmux {
+    inner: SocketTmux,
+    target: String,
+    option: &'static str,
+    value: &'static str,
+    once: std::sync::atomic::AtomicBool,
+}
+
+impl Tmux for MutatingDuplicateTmux {
+    fn run(&self, args: &[&str]) -> String {
+        if args.first() == Some(&"if-shell")
+            && !args.contains(&"-F")
+            && args.iter().any(|arg| arg.contains("kill-window"))
+            && self.once.swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            tmux_ok(
+                &self.inner.socket,
+                &["set-option", "-w", "-t", &self.target, self.option, self.value],
+            );
+        }
+        self.inner.run(args)
+    }
+}
+
+/// Two independent rail processes can both observe the first company read.
+/// The create decision belongs to tmux's one command queue, so that race still
+/// publishes one logical focus window.
+#[test]
+fn concurrent_real_tmux_focus_ensures_mint_one_window() {
+    let Some(server) = live_server("focus-mint-cas") else { return };
+    let socket = server.socket().to_owned();
+    let session = "org-acme_";
+    tmux_ok(
+        &socket,
+        &[
+            "new-session",
+            "-d",
+            "-s",
+            session,
+            "-x",
+            "200",
+            "-y",
+            "50",
+            "-n",
+            "Executive",
+            "/bin/sh",
+            "-c",
+            "while :; do sleep 3600 & wait $!; done",
+        ],
+    );
+    tmux_ok(&socket, &["set-option", "-t", session, tags::ORGANIZATION, "acme"]);
+    let first_reads = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let results = std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            let socket = socket.clone();
+            let first_reads = first_reads.clone();
+            handles.push(scope.spawn(move || {
+                let tmux = FirstWindowReadTmux {
+                    inner: SocketTmux { socket },
+                    first: std::sync::atomic::AtomicBool::new(true),
+                    replacement: None,
+                    gate: Some(first_reads),
+                };
+                effects::ensure_focus_window(
+                    &tmux,
+                    session,
+                    &effects::Parked {
+                        organization: "acme",
+                        rail_program: None,
+                        company_dir: std::path::Path::new("/company"),
+                    },
+                )
+            }));
+        }
+        handles
+            .into_iter()
+            .map(|handle| handle.join().expect("the focus ensure does not panic"))
+            .collect::<Vec<_>>()
+    });
+    assert!(
+        results.iter().all(Option::is_some) && results[0] == results[1],
+        "both concurrent owners must resolve the same focus window: {results:?}"
+    );
+    let focus = tmux_out(
+        &socket,
+        &["list-windows", "-t", session, "-F", &format!("#{{window_id}}\t#{{{}}}", tags::WINDOW)],
+    );
+    assert_eq!(
+        focus.lines().filter(|line| line.ends_with("\t__focus__")).count(),
+        1,
+        "two simultaneous owners must publish one focus window: {focus:?}"
+    );
+}
+
+#[test]
+fn an_empty_client_census_cannot_duplicate_an_existing_real_focus_window() {
+    let Some(server) = live_server("focus-mint-empty-read") else { return };
+    let socket = server.socket().to_owned();
+    let session = "org-acme_";
+    tmux_ok(
+        &socket,
+        &[
+            "new-session",
+            "-d",
+            "-s",
+            session,
+            "/bin/sh",
+            "-c",
+            "while :; do sleep 3600 & wait $!; done",
+        ],
+    );
+    tmux_ok(&socket, &["set-option", "-t", session, tags::ORGANIZATION, "acme"]);
+    let (original, _) = tagged_focus_window(&socket, session, true);
+    let tmux = FirstWindowReadTmux {
+        inner: SocketTmux { socket: socket.clone() },
+        first: std::sync::atomic::AtomicBool::new(true),
+        replacement: Some(String::new()),
+        gate: None,
+    };
+
+    assert_eq!(
+        effects::ensure_focus_window(
+            &tmux,
+            session,
+            &effects::Parked {
+                organization: "acme",
+                rail_program: None,
+                company_dir: std::path::Path::new("/company"),
+            },
+        ),
+        Some(original.clone())
+    );
+    assert!(
+        !tmux.first.load(std::sync::atomic::Ordering::SeqCst),
+        "the test must force the first focus census to answer empty"
+    );
+    assert_eq!(
+        tmux_out(
+            &socket,
+            &[
+                "list-windows",
+                "-t",
+                session,
+                "-F",
+                &format!("#{{window_id}}\t#{{{}}}", tags::WINDOW),
+            ],
+        )
+        .lines()
+        .filter(|line| line.ends_with("\t__focus__"))
+        .map(str::to_owned)
+        .collect::<Vec<_>>(),
+        [format!("{original}\t__focus__")],
+        "a failed client read cannot authorize a second focus window"
+    );
+}
+
+fn tagged_focus_window(socket: &str, session: &str, first: bool) -> (String, String) {
+    let window = if first {
+        tmux_out(socket, &["display-message", "-p", "-t", session, "#{window_id}"])
+    } else {
+        tmux_out(
+            socket,
+            &[
+                "new-window",
+                "-d",
+                "-a",
+                "-t",
+                &format!("{session}:$"),
+                "-P",
+                "-F",
+                "#{window_id}",
+                "/bin/sh",
+                "-c",
+                "while :; do sleep 3600 & wait $!; done",
+            ],
+        )
+    };
+    let pane = tmux_out(socket, &["display-message", "-p", "-t", &window, "#{pane_id}"]);
+    let rail = tmux_out(
+        socket,
+        &[
+            "split-window",
+            "-h",
+            "-b",
+            "-l",
+            "26",
+            "-t",
+            &pane,
+            "-P",
+            "-F",
+            "#{pane_id}",
+            "/bin/sh",
+            "-c",
+            "while :; do sleep 3600 & wait $!; done",
+        ],
+    );
+    tmux_ok(
+        socket,
+        &[
+            "set-option",
+            "-w",
+            "-t",
+            &window,
+            tags::ORGANIZATION,
+            "acme",
+            ";",
+            "set-option",
+            "-w",
+            "-t",
+            &window,
+            tags::WINDOW,
+            placement::FOCUS_WINDOW_ID,
+            ";",
+            "set-option",
+            "-p",
+            "-t",
+            &pane,
+            tags::ASLEEP,
+            placement::FOCUS_WINDOW_ID,
+            ";",
+            "set-option",
+            "-p",
+            "-t",
+            &rail,
+            tags::SIDEBAR,
+            "1",
+        ],
+    );
+    (window, pane)
+}
+
+#[test]
+fn a_real_inactive_duplicate_made_only_of_focus_furniture_is_repaired() {
+    let Some(server) = live_server("focus-duplicate-repair") else { return };
+    let socket = server.socket().to_owned();
+    let session = "org-acme_";
+    tmux_ok(
+        &socket,
+        &[
+            "new-session",
+            "-d",
+            "-s",
+            session,
+            "/bin/sh",
+            "-c",
+            "while :; do sleep 3600 & wait $!; done",
+        ],
+    );
+    tmux_ok(&socket, &["set-option", "-t", session, tags::ORGANIZATION, "acme"]);
+    let (older, _) = tagged_focus_window(&socket, session, true);
+    let (keeper, keeper_body) = tagged_focus_window(&socket, session, false);
+    let ordinary = tmux_out(
+        &socket,
+        &[
+            "new-window",
+            "-d",
+            "-a",
+            "-t",
+            &format!("{session}:$"),
+            "-P",
+            "-F",
+            "#{window_id}",
+            "/bin/sh",
+            "-c",
+            "while :; do sleep 3600 & wait $!; done",
+        ],
+    );
+    let tmux = SocketTmux { socket: socket.clone() };
+    tmux_ok(
+        &socket,
+        &[
+            "set-option",
+            "-p",
+            "-u",
+            "-t",
+            &keeper_body,
+            tags::ASLEEP,
+            ";",
+            "set-option",
+            "-p",
+            "-t",
+            &keeper_body,
+            tags::SLEEPING_PERSON,
+            "nia",
+        ],
+    );
+    tmux_ok(&socket, &["select-window", "-t", &keeper]);
+    assert_eq!(
+        effects::ensure_focus_window(
+            &tmux,
+            session,
+            &effects::Parked {
+                organization: "acme",
+                rail_program: None,
+                company_dir: std::path::Path::new("/company"),
+            },
+        ),
+        Some(keeper.clone()),
+        "the newer active legitimate body is the keeper; the older parked duplicate is deleted"
+    );
+    let windows = tmux_out(
+        &socket,
+        &["list-windows", "-t", session, "-F", &format!("#{{window_id}}\t#{{{}}}", tags::WINDOW)],
+    );
+    assert_eq!(
+        windows
+            .lines()
+            .filter(|line| line.ends_with("\t__focus__"))
+            .map(str::to_owned)
+            .collect::<Vec<_>>(),
+        [format!("{keeper}\t__focus__")],
+        "the active newer focus survives instead of the lower numeric id: {windows:?}"
+    );
+    assert!(!windows.lines().any(|line| line.starts_with(&older)));
+
+    tmux_ok(
+        &socket,
+        &[
+            "set-option",
+            "-p",
+            "-u",
+            "-t",
+            &keeper_body,
+            tags::SLEEPING_PERSON,
+            ";",
+            "set-option",
+            "-p",
+            "-t",
+            &keeper_body,
+            tags::ASLEEP,
+            placement::FOCUS_WINDOW_ID,
+        ],
+    );
+    let (newer, _) = tagged_focus_window(&socket, session, false);
+    tmux_ok(&socket, &["select-window", "-t", &ordinary]);
+    assert_eq!(
+        effects::ensure_focus_window(
+            &tmux,
+            session,
+            &effects::Parked {
+                organization: "acme",
+                rail_program: None,
+                company_dir: std::path::Path::new("/company"),
+            },
+        ),
+        Some(keeper.clone())
+    );
+    let windows = tmux_out(
+        &socket,
+        &["list-windows", "-t", session, "-F", &format!("#{{window_id}}\t#{{{}}}", tags::WINDOW)],
+    );
+    assert_eq!(
+        windows
+            .lines()
+            .filter(|line| line.ends_with("\t__focus__"))
+            .map(str::to_owned)
+            .collect::<Vec<_>>(),
+        [format!("{keeper}\t__focus__")],
+        "with all focus windows inactive and parked, the lower numeric id survives: {windows:?}"
+    );
+    assert!(!windows.lines().any(|line| line.starts_with(&newer)));
+    assert!(windows.lines().any(|line| line.starts_with(&ordinary)));
+}
+
+#[test]
+fn a_real_duplicate_with_unknown_local_state_is_left_for_fail_closed_planning() {
+    let Some(server) = live_server("focus-duplicate-unknown") else { return };
+    let socket = server.socket().to_owned();
+    let session = "org-acme_";
+    tmux_ok(
+        &socket,
+        &[
+            "new-session",
+            "-d",
+            "-s",
+            session,
+            "/bin/sh",
+            "-c",
+            "while :; do sleep 3600 & wait $!; done",
+        ],
+    );
+    tmux_ok(&socket, &["set-option", "-t", session, tags::ORGANIZATION, "acme"]);
+    let (active, _) = tagged_focus_window(&socket, session, true);
+    let (unknown, _) = tagged_focus_window(&socket, session, false);
+    tmux_ok(&socket, &["set-option", "-w", "-t", &unknown, "@chief_unknown", "1"]);
+    tmux_ok(&socket, &["select-window", "-t", &active]);
+    let tmux = SocketTmux { socket: socket.clone() };
+
+    assert_eq!(
+        effects::ensure_focus_window(
+            &tmux,
+            session,
+            &effects::Parked {
+                organization: "acme",
+                rail_program: None,
+                company_dir: std::path::Path::new("/company"),
+            },
+        ),
+        None
+    );
+    assert_eq!(
+        tmux_out(&socket, &["list-windows", "-t", session, "-F", "#{window_id}"]).lines().count(),
+        2,
+        "unknown ownership is never repaired by deletion"
+    );
+}
+
+#[test]
+fn a_duplicate_that_changes_after_snapshot_is_not_deleted() {
+    let Some(server) = live_server("focus-duplicate-cas") else { return };
+    let socket = server.socket().to_owned();
+    let session = "org-acme_";
+    tmux_ok(
+        &socket,
+        &[
+            "new-session",
+            "-d",
+            "-s",
+            session,
+            "/bin/sh",
+            "-c",
+            "while :; do sleep 3600 & wait $!; done",
+        ],
+    );
+    tmux_ok(&socket, &["set-option", "-t", session, tags::ORGANIZATION, "acme"]);
+    let _ = tagged_focus_window(&socket, session, true);
+    let (candidate, _) = tagged_focus_window(&socket, session, false);
+    let ordinary = tmux_out(
+        &socket,
+        &[
+            "new-window",
+            "-d",
+            "-a",
+            "-t",
+            &format!("{session}:$"),
+            "-P",
+            "-F",
+            "#{window_id}",
+            "/bin/sh",
+            "-c",
+            "while :; do sleep 3600 & wait $!; done",
+        ],
+    );
+    tmux_ok(&socket, &["select-window", "-t", &ordinary]);
+    let tmux = MutatingDuplicateTmux {
+        inner: SocketTmux { socket: socket.clone() },
+        target: candidate,
+        option: "@chief_unknown",
+        value: "1",
+        once: std::sync::atomic::AtomicBool::new(true),
+    };
+
+    assert_eq!(
+        effects::ensure_focus_window(
+            &tmux,
+            session,
+            &effects::Parked {
+                organization: "acme",
+                rail_program: None,
+                company_dir: std::path::Path::new("/company"),
+            },
+        ),
+        None
+    );
+    assert!(
+        !tmux.once.load(std::sync::atomic::Ordering::SeqCst),
+        "the mutation must land after the snapshot and before the delete CAS"
+    );
+    let focus = tmux_out(
+        &socket,
+        &["list-windows", "-t", session, "-F", &format!("#{{window_id}}\t#{{{}}}", tags::WINDOW)],
+    );
+    assert_eq!(focus.lines().filter(|line| line.ends_with("\t__focus__")).count(), 2);
+}
+
+#[test]
+fn a_keeper_that_changes_after_snapshot_preserves_the_other_focus_window() {
+    let Some(server) = live_server("focus-keeper-cas") else { return };
+    let socket = server.socket().to_owned();
+    let session = "org-acme_";
+    tmux_ok(
+        &socket,
+        &[
+            "new-session",
+            "-d",
+            "-s",
+            session,
+            "/bin/sh",
+            "-c",
+            "while :; do sleep 3600 & wait $!; done",
+        ],
+    );
+    tmux_ok(&socket, &["set-option", "-t", session, tags::ORGANIZATION, "acme"]);
+    let (keeper, _) = tagged_focus_window(&socket, session, true);
+    let (candidate, _) = tagged_focus_window(&socket, session, false);
+    let ordinary = tmux_out(
+        &socket,
+        &[
+            "new-window",
+            "-d",
+            "-a",
+            "-t",
+            &format!("{session}:$"),
+            "-P",
+            "-F",
+            "#{window_id}",
+            "/bin/sh",
+            "-c",
+            "while :; do sleep 3600 & wait $!; done",
+        ],
+    );
+    tmux_ok(&socket, &["select-window", "-t", &ordinary]);
+    let tmux = MutatingDuplicateTmux {
+        inner: SocketTmux { socket: socket.clone() },
+        target: keeper.clone(),
+        option: tags::WINDOW,
+        value: "__changed__",
+        once: std::sync::atomic::AtomicBool::new(true),
+    };
+
+    assert_eq!(
+        effects::ensure_focus_window(
+            &tmux,
+            session,
+            &effects::Parked {
+                organization: "acme",
+                rail_program: None,
+                company_dir: std::path::Path::new("/company"),
+            },
+        ),
+        None
+    );
+    assert!(
+        !tmux.once.load(std::sync::atomic::Ordering::SeqCst),
+        "the keeper mutation must land after selection and before the delete CAS"
+    );
+    let windows = tmux_out(
+        &socket,
+        &["list-windows", "-t", session, "-F", &format!("#{{window_id}}\t#{{{}}}", tags::WINDOW)],
+    );
+    assert!(windows.lines().any(|line| line == format!("{keeper}\t__changed__")));
+    assert!(
+        windows.lines().any(|line| line == format!("{candidate}\t{}", placement::FOCUS_WINDOW_ID)),
+        "a stale repair must not delete the remaining valid focus candidate: {windows:?}"
+    );
 }
 
 #[derive(Clone, Copy)]
