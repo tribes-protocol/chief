@@ -240,6 +240,15 @@ pub fn window_department_id(tmux: &dyn Tmux, pane_id: &str) -> Option<String> {
 /// department mints none at all (`placement.rs`'s empty-department rule), and a
 /// department whose people all stopped loses its window the same way.
 pub fn department_window(tmux: &dyn Tmux, session: &str, department_id: &str) -> Option<String> {
+    department_windows(tmux, session, department_id).into_iter().next()
+}
+
+/// Every tmux window carrying one logical window id.
+///
+/// Most callers require one answer and use [`department_window`]. The focus
+/// owner must see the complete set: taking the first duplicate hides the exact
+/// topology that makes the actuator fail closed.
+fn department_windows(tmux: &dyn Tmux, session: &str, department_id: &str) -> Vec<String> {
     tmux.run(&[
         "list-windows",
         "-t",
@@ -249,8 +258,10 @@ pub fn department_window(tmux: &dyn Tmux, session: &str, department_id: &str) ->
     ])
     .lines()
     .filter_map(|line| line.split_once('\t'))
-    .find(|(_, logical)| logical.trim() == department_id)
+    .filter(|(_, logical)| logical.trim() == department_id)
     .map(|(window, _)| window.trim().to_owned())
+    .filter(|window| window.starts_with('@'))
+    .collect()
 }
 
 /// A run of tmux WRITES issued as one invocation.
@@ -2186,6 +2197,28 @@ fn local_focus_panes(
     session: &str,
     organization: &str,
 ) -> Option<Vec<LocalFocusPane>> {
+    let focus = local_focus_scope(tmux, session, organization)?;
+    if focus.len() != 2
+        || focus.iter().any(|pane| {
+            pane.window != focus[0].window
+                || pane.session_id != focus[0].session_id
+                || pane.window_panes != "2"
+        })
+    {
+        return None;
+    }
+    Some(focus)
+}
+
+/// Every pane in every fully and locally owned focus window.
+///
+/// A caller gets no partial answer. One unreadable pane, one inherited window
+/// tag, or one foreign scope makes the whole observation unusable.
+fn local_focus_scope(
+    tmux: &dyn Tmux,
+    session: &str,
+    organization: &str,
+) -> Option<Vec<LocalFocusPane>> {
     let listed = tmux.run(&["list-panes", "-s", "-t", session, "-F", "#{pane_id}"]);
     let pane_ids =
         listed.lines().map(str::trim).filter(|pane| !pane.is_empty()).collect::<Vec<_>>();
@@ -2254,15 +2287,6 @@ fn local_focus_panes(
             focus.push(snapshot);
         }
     }
-    if focus.len() != 2
-        || focus.iter().any(|pane| {
-            pane.window != focus[0].window
-                || pane.session_id != focus[0].session_id
-                || pane.window_panes != "2"
-        })
-    {
-        return None;
-    }
     Some(focus)
 }
 
@@ -2280,6 +2304,7 @@ fn clean_focus_rail(pane: &LocalFocusPane) -> bool {
             tags::WAKING_DESIRED_SEEN,
             tags::MINTING,
             tags::SLEEPING_PERSON,
+            tags::DEPARTMENT_CARD,
             WAKING_RECOVERY_READY,
         ]
         .iter()
@@ -2377,6 +2402,14 @@ fn exact_local_option_shell(scope: &str, target: &str, option: &str, value: &str
         shell_word(target),
         shell_word(option),
         shell_word(value),
+    )
+}
+
+fn exact_local_user_option_count_shell(scope: &str, target: &str, count: usize) -> String {
+    let scope = if scope.is_empty() { String::new() } else { format!(" {scope}") };
+    format!(
+        "tmux show-options{scope} -t {} 2>/dev/null | awk '$1 ~ /^@/ {{ found++ }} END {{ exit found == {count} ? 0 : 1 }}'",
+        shell_word(target),
     )
 }
 
@@ -2963,7 +2996,12 @@ pub struct Parked<'a> {
 /// Called on every company read, which is off the click path. Answers the
 /// window, or `None` when tmux would not mint one.
 pub fn ensure_focus_window(tmux: &dyn Tmux, session: &str, parked: &Parked) -> Option<String> {
-    let Some(window) = department_window(tmux, session, FOCUS_WINDOW_ID) else {
+    let mut windows = department_windows(tmux, session, FOCUS_WINDOW_ID);
+    if windows.len() > 1 {
+        let window = repair_duplicate_focus_windows(tmux, session, parked.organization, &windows)?;
+        windows = vec![window];
+    }
+    let Some(window) = windows.into_iter().next() else {
         let canonical = canonical_geometry(tmux, session);
         return mint_parked_focus_window(tmux, session, parked, canonical);
     };
@@ -3006,6 +3044,226 @@ pub fn ensure_focus_window(tmux: &dyn Tmux, session: &str, parked: &Parked) -> O
          cannot go blank and the rail cannot inherit the whole window"
     );
     Some(window)
+}
+
+#[derive(Clone, Copy)]
+enum FocusFurniture {
+    Rail,
+    Notice,
+}
+
+fn focus_furniture(pane: &LocalFocusPane) -> Option<FocusFurniture> {
+    let rail_options = BTreeMap::from([(tags::SIDEBAR.to_owned(), "1".to_owned())]);
+    if clean_focus_rail(pane) && pane.pane_options == rail_options {
+        return Some(FocusFurniture::Rail);
+    }
+    let notice_options = BTreeMap::from([(tags::ASLEEP.to_owned(), FOCUS_WINDOW_ID.to_owned())]);
+    (pane.pane_options == notice_options).then_some(FocusFurniture::Notice)
+}
+
+/// Repair the old check-then-mint race, but only where every removed byte is
+/// proven to be disposable focus furniture.
+fn repair_duplicate_focus_windows(
+    tmux: &dyn Tmux,
+    session: &str,
+    organization: &str,
+    observed: &[String],
+) -> Option<String> {
+    let panes = local_focus_scope(tmux, session, organization)?;
+    let mut by_window = BTreeMap::<String, Vec<&LocalFocusPane>>::new();
+    for pane in &panes {
+        by_window.entry(pane.window.clone()).or_default().push(pane);
+    }
+    let observed = observed.iter().cloned().collect::<BTreeSet<_>>();
+    if by_window.keys().cloned().collect::<BTreeSet<_>>() != observed {
+        return None;
+    }
+
+    let mut removable = BTreeSet::new();
+    let mut non_removable = BTreeSet::new();
+    let mut active = BTreeSet::new();
+    for (window, panes) in &by_window {
+        let expected = panes.len().to_string();
+        let exact_window_options = BTreeMap::from([
+            (tags::ORGANIZATION.to_owned(), organization.to_owned()),
+            (tags::WINDOW.to_owned(), FOCUS_WINDOW_ID.to_owned()),
+        ]);
+        let roles = panes.iter().map(|pane| focus_furniture(pane)).collect::<Option<Vec<_>>>();
+        let exact_count = !panes.is_empty()
+            && panes.iter().all(|pane| pane.window_panes == expected)
+            && panes.iter().all(|pane| pane.window_options == exact_window_options)
+            && roles.as_ref().is_some_and(|roles| {
+                roles.iter().filter(|role| matches!(role, FocusFurniture::Notice)).count() == 1
+                    && roles.iter().filter(|role| matches!(role, FocusFurniture::Rail)).count() == 1
+            });
+        let active_read = tmux.run(&["display-message", "-p", "-t", window, "#{window_active}"]);
+        match active_read.trim() {
+            "0" => {
+                if exact_count {
+                    removable.insert(window.clone());
+                } else {
+                    non_removable.insert(window.clone());
+                }
+            }
+            "1" => {
+                active.insert(window.clone());
+                if exact_count {
+                    removable.insert(window.clone());
+                } else {
+                    non_removable.insert(window.clone());
+                }
+            }
+            _ => return None,
+        }
+    }
+    if active.len() > 1 {
+        return None;
+    }
+    let keeper = if let Some(active) = active.into_iter().next() {
+        if observed.iter().any(|window| window != &active && !removable.contains(window)) {
+            return None;
+        }
+        active
+    } else if non_removable.len() == 1 {
+        non_removable.into_iter().next()?
+    } else if non_removable.is_empty() {
+        removable
+            .iter()
+            .filter_map(|window| {
+                window.strip_prefix('@')?.parse::<u64>().ok().map(|id| (id, window))
+            })
+            .min_by_key(|(id, _)| *id)
+            .map(|(_, window)| window.clone())?
+    } else {
+        return None;
+    };
+    for window in observed.iter().filter(|window| **window != keeper) {
+        if !removable.contains(window)
+            || !kill_duplicate_focus_furniture(
+                tmux,
+                session,
+                organization,
+                &keeper,
+                window,
+                by_window.get(window)?,
+            )
+        {
+            return None;
+        }
+    }
+    let remaining = department_windows(tmux, session, FOCUS_WINDOW_ID);
+    if remaining != [keeper.clone()] {
+        return None;
+    }
+    tracing::warn!(
+        event = "sidebar.focus.duplicates.repaired",
+        session,
+        keeper = %keeper,
+        observed = ?observed,
+        "removed duplicate focus windows contained only exact parked furniture; inactive \
+         duplicates were repaired before the next actuator plan"
+    );
+    Some(keeper)
+}
+
+fn kill_duplicate_focus_furniture(
+    tmux: &dyn Tmux,
+    session: &str,
+    organization: &str,
+    keeper: &str,
+    window: &str,
+    panes: &[&LocalFocusPane],
+) -> bool {
+    let generation = invalidate_viewport_topology(tmux, session);
+    let Some(generation) = generation else { return false };
+    let success = format!("chief-focus-duplicate-reaped:{}", uuid::Uuid::new_v4().simple());
+    let equals =
+        |field: &str, value: &str| format!("#{{==:#{{{field}}},{}}}", super::tmux_static(value));
+    let and = |left: String, right: String| format!("#{{&&:{left},{right}}}");
+    let mut action = Batch::new();
+    action.push(&["kill-window", "-t", window]);
+    action.push(&["display-message", "-p", "-t", session, &success]);
+    let expected = panes.len().to_string();
+    for pane in panes.iter().rev() {
+        let Some(role) = focus_furniture(pane) else {
+            refresh_viewport_topology(tmux, session, &generation);
+            return false;
+        };
+        let (sidebar, asleep) = match role {
+            FocusFurniture::Rail => ("1", ""),
+            FocusFurniture::Notice => ("", FOCUS_WINDOW_ID),
+        };
+        let predicate = [
+            equals("session_id", &pane.session_id),
+            equals("window_id", window),
+            equals("window_active", "0"),
+            equals("window_panes", &expected),
+            equals("pane_id", &pane.pane),
+            equals("pane_pid", &pane.pid),
+            equals("pane_dead", "0"),
+            equals(tags::ORGANIZATION, organization),
+            equals(tags::WINDOW, FOCUS_WINDOW_ID),
+            equals(tags::SIDEBAR, sidebar),
+            equals(tags::ASLEEP, asleep),
+            equals(tags::PERSON, ""),
+            equals(tags::LAUNCH_HASH, ""),
+            equals(tags::WAKING_PERSON, ""),
+            equals(tags::WAKE_CLAIM, ""),
+            equals(tags::WAKING_PENDING, ""),
+            equals(tags::WAKING_DESIRED_SEEN, ""),
+            equals(tags::MINTING, ""),
+            equals(tags::SLEEPING_PERSON, ""),
+            equals(tags::DEPARTMENT_CARD, ""),
+        ]
+        .into_iter()
+        .rev()
+        .reduce(|right, left| and(left, right));
+        let Some(predicate) = predicate else {
+            refresh_viewport_topology(tmux, session, &generation);
+            return false;
+        };
+        let mut guarded = Batch::new();
+        guarded.push(&[
+            "if-shell",
+            "-F",
+            "-t",
+            &pane.pane,
+            &predicate,
+            &action.command_string(),
+            "",
+        ]);
+        action = guarded;
+    }
+    // The keeper is part of the mutation boundary too. If it stops being this
+    // company's focus window after selection, deleting another focus window
+    // can remove the last valid candidate. The server must refuse that stale
+    // repair and let the next pass take a new snapshot.
+    let local_scope = [
+        exact_local_option_shell("", &panes[0].session_id, tags::ORGANIZATION, organization),
+        exact_local_option_shell("-w", keeper, tags::ORGANIZATION, organization),
+        exact_local_option_shell("-w", keeper, tags::WINDOW, FOCUS_WINDOW_ID),
+        exact_local_option_shell("-w", window, tags::ORGANIZATION, organization),
+        exact_local_option_shell("-w", window, tags::WINDOW, FOCUS_WINDOW_ID),
+        exact_local_user_option_count_shell("-w", window, 2),
+    ]
+    .into_iter()
+    .chain(panes.iter().flat_map(|pane| {
+        let (option, value) = match focus_furniture(pane) {
+            Some(FocusFurniture::Rail) => (tags::SIDEBAR, "1"),
+            Some(FocusFurniture::Notice) => (tags::ASLEEP, FOCUS_WINDOW_ID),
+            None => (tags::PERSON, "__never__"),
+        };
+        [
+            exact_local_option_shell("-p", &pane.pane, option, value),
+            exact_local_user_option_count_shell("-p", &pane.pane, 1),
+        ]
+    }))
+    .collect::<Vec<_>>()
+    .join(" && ");
+    let output =
+        tmux.run(&["if-shell", "-t", &panes[0].pane, &local_scope, &action.command_string(), ""]);
+    refresh_viewport_topology(tmux, session, &generation);
+    output.lines().any(|line| line.trim() == success)
 }
 
 /// One live focus-pane snapshot. Every non-rail body counts as furnishing,
@@ -3379,22 +3637,38 @@ fn mint_parked_focus_window(
 ) -> Option<String> {
     let last = format!("{session}:$");
     let topology_generation = invalidate_viewport_topology(tmux, session)?;
+    let mut mint = Batch::new();
+    mint.push(&[
+        "new-window",
+        "-d",
+        "-a",
+        "-n",
+        PARKED_WINDOW_NAME,
+        "-t",
+        &last,
+        "-P",
+        "-F",
+        "#{window_id}",
+        "sh",
+        "-c",
+        &parked_script(),
+    ]);
+    // Identity is part of the create queue. The window cannot be visible as a
+    // candidate between these commands, and the first pane cannot be mistaken
+    // for a person before its furniture tag arrives.
+    mint.push(&["set-option", "-w", "-t", &last, tags::ORGANIZATION, parked.organization]);
+    mint.push(&["set-option", "-w", "-t", &last, tags::WINDOW, FOCUS_WINDOW_ID]);
+    mint.push(&["set-option", "-p", "-t", &last, tags::ASLEEP, FOCUS_WINDOW_ID]);
+
+    // THE SERVER-SIDE CREATE-IF-ABSENT. A client-side list followed by
+    // `new-window` lets two rail processes both observe absence. Tmux evaluates
+    // this loop and, when it is empty, runs the complete mint in one command
+    // queue. A competing queue then sees the first window's logical tag and
+    // takes the empty branch.
+    let matches = ["#{W:#{?#{==:#{", tags::WINDOW, "},", FOCUS_WINDOW_ID, "},1,}}"].concat();
+    let absent = format!("#{{==:{matches},}}");
     let window = tmux
-        .run(&[
-            "new-window",
-            "-d",
-            "-a",
-            "-n",
-            PARKED_WINDOW_NAME,
-            "-t",
-            &last,
-            "-P",
-            "-F",
-            "#{window_id}",
-            "sh",
-            "-c",
-            &parked_script(),
-        ])
+        .run(&["if-shell", "-F", "-t", session, &absent, &mint.command_string(), ""])
         .lines()
         .next()
         .map(str::trim)
@@ -3402,23 +3676,9 @@ fn mint_parked_focus_window(
         .map(ToOwned::to_owned);
     let Some(window) = window else {
         refresh_viewport_topology(tmux, session, &topology_generation);
-        return None;
+        let windows = department_windows(tmux, session, FOCUS_WINDOW_ID);
+        return (windows.len() == 1).then(|| windows[0].clone());
     };
-    tmux.run(&[
-        "set-option",
-        "-w",
-        "-t",
-        &window,
-        tags::ORGANIZATION,
-        parked.organization,
-        ";",
-        "set-option",
-        "-w",
-        "-t",
-        &window,
-        tags::WINDOW,
-        FOCUS_WINDOW_ID,
-    ]);
     // The window's ONE pane is the notice `new-window` just started. It carries
     // no person tag and never will: it is furniture, and the converge audit must
     // read it as furniture rather than adopting it as somebody.
