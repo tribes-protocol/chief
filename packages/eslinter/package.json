@@ -9,11 +9,11 @@
     "test:unit:coverage": "vitest run --coverage"
   },
   "dependencies": {
-    "@typescript-eslint/utils": "8.68.0"
+    "@typescript-eslint/utils": "8.69.0"
   },
   "devDependencies": {
-    "@typescript-eslint/parser": "8.68.0",
-    "eslint": "10.9.1",
+    "@typescript-eslint/parser": "8.69.0",
+    "eslint": "10.10.0",
     "vitest": "4.1.11"
   }
 }
